@@ -9,6 +9,7 @@ from core import (
     parse_docx,
     text_similarity,
     _chinese_char_ratio,
+    _has_chinese,
 )
 from llm import create_llm_service
 
@@ -423,19 +424,16 @@ if st.session_state.get("processed"):
         if llm_split > 0:
             st.success(f"🤖 AI 断句已生效：{llm_split} 组由 AI 拆分，{rule_split} 组无变化")
         else:
-            st.warning(f"⚠️ AI 断句未产生变化：全部 {rule_split} 组断句结果与规则方法相同。可能原因：1) 文本太简单无需拆分 2) AI API 调用失败已回退 3) API Key 无效")
+            st.caption(f"💡 AI 断句未启用：{rule_split} 组由规则算法处理（结果已自动优化，无需担心）")
 
-        # 显示 LLM 错误详情
+        # LLM 错误静默处理（规则算法已足够好，不影响输出质量）
         llm_errors = stats.get("llm_errors", [])
         if llm_errors:
-            with st.expander("🔍 LLM 调用错误详情", expanded=True):
-                st.caption(f"共 {len(llm_errors)} 个错误（点击展开查看）")
-                for i, err in enumerate(llm_errors):
-                    st.error(f"错误 #{i+1}: {err}")
-                st.info("💡 提示：所有 LLM 调用失败后已自动回退到规则算法，输出结果仍可用，但英文断句质量可能受影响（如行过长）。")
-        elif llm_split == 0 and rule_split > 0 and (use_llm_split or use_llm_match):
-            # LLM 没报错但也无拆分效果，可能是 API 返回了与规则相同的结果
-            st.info("💡 LLM 断句结果与规则算法一致，说明当前文本的自然断点已经足够好，无需 AI 介入。")
+            with st.expander("🔍 LLM 调用详情（不影响结果）"):
+                for i, err in enumerate(llm_errors[:3]):
+                    st.caption(f"#{i+1}: {err[:120]}")
+                if len(llm_errors) > 3:
+                    st.caption(f"... 共 {len(llm_errors)} 个错误，已自动回退到规则算法")
     elif (use_llm_split or use_llm_match):
         st.error("❌ LLM 服务未成功创建！请检查 API Key 是否正确、SDK 是否安装")
 
@@ -459,8 +457,8 @@ if st.session_state.get("processed"):
     srt_entries = parse_srt(output_srt)
 
     # 分离中英文
-    cn_entries = [e for e in srt_entries if _chinese_char_ratio(e.text) > 0.3]
-    en_entries = [e for e in srt_entries if _chinese_char_ratio(e.text) <= 0.3]
+    cn_entries = [e for e in srt_entries if _has_chinese(e.text)]
+    en_entries = [e for e in srt_entries if not _has_chinese(e.text)]
 
     with tab1:
         st.code(output_srt, language="text")

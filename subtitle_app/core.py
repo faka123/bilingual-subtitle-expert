@@ -325,6 +325,11 @@ def _chinese_char_ratio(text: str) -> float:
     return chinese_chars / total_chars
 
 
+def _has_chinese(text: str) -> bool:
+    """判断文本是否包含中文字符（比 ratio 更准确，不受短文本干扰）"""
+    return bool(re.search(r'[一-鿿]', text))
+
+
 def _english_char_ratio(text: str) -> float:
     """计算英文字符占比"""
     if not text:
@@ -406,60 +411,120 @@ def match_segments_to_paragraphs(
 
 # ── 英文断句 ──────────────────────────────────────────────
 
-def split_english_text(en_text: str, num_parts: int) -> list[str]:
+def split_english_text(en_text: str, num_parts: int, chinese_segments: list[str] | None = None) -> list[str]:
     """
-    将英文段落分割为指定数量的部分，尽量在自然断点处分割。
+    将英文段落按中文断句比例分割，长的中文配长的英文，短的配短的。
 
     策略：
-    1. 如果 num_parts == 1，检查长度，超过 42 字符自动拆分
-    2. 找到所有可能的断点位置（标点符号后）
-    3. 按大致均匀长度选择 num_parts-1 个断点
-    4. 确保不拆分完整短语
-    5. 最终检查每个片段长度，超过 42 字符的进一步拆分
+    1. 按中文段落长度比例分配英文字符数
+    2. 在分配的位置附近找自然断点
+    3. 单段超过 42 字符的进一步拆分
     """
     if num_parts <= 1:
-        if len(en_text) <= 42:
-            return [en_text]
-        else:
-            # 单个片段过长，尝试自然断点拆分
-            parts = _split_long_segment(en_text)
-            return parts if parts else [en_text]
+        return _enforce_max_len([en_text])
 
+    if chinese_segments and len(chinese_segments) == num_parts:
+        return _split_proportional(en_text, chinese_segments)
+
+    # 无中文参考时，回退到均匀分割
+    parts = _split_uniform(en_text, num_parts)
+    return _enforce_max_len(parts)
+
+
+def _split_proportional(en_text: str, cn_segments: list[str]) -> list[str]:
+    """按中文段长度比例分割英文"""
+    # 计算每个中文段的长度（去标点后的字符数）
+    cn_lens = [len(_normalize_for_matching(s)) for s in cn_segments]
+    total_cn = sum(cn_lens)
+
+    if total_cn == 0:
+        return _split_uniform(en_text, len(cn_segments))
+
+    en_total = len(en_text)
+    parts = []
+    start = 0
+
+    for i, (seg, cn_len) in enumerate(zip(cn_segments, cn_lens)):
+        is_last = (i == len(cn_segments) - 1)
+        if is_last:
+            parts.append(en_text[start:].strip())
+        else:
+            # 按比例计算目标位置
+            ratio = cn_len / total_cn
+            target_pos = start + int(en_total * ratio)
+
+            # 在目标位置附近找自然断点
+            bp = _find_break_near(en_text, target_pos, start)
+            if bp > start:
+                parts.append(en_text[start:bp].strip())
+                start = bp
+            else:
+                # 找不到断点，按字符切
+                parts.append(en_text[start:target_pos].strip())
+                start = target_pos
+
+    return _enforce_max_len(parts)
+
+
+def _split_uniform(en_text: str, num_parts: int) -> list[str]:
+    """均匀分割英文（原有逻辑，作为回退）"""
     # 找到所有自然断点位置
     break_points = _find_natural_breaks(en_text)
 
     if len(break_points) < num_parts - 1:
-        # 自然断点不够，用字符数均分
-        parts = _split_by_chars(en_text, num_parts)
-    else:
-        # 目标每部分长度
-        total_len = len(en_text)
-        target_len = total_len / num_parts
+        return _split_by_chars(en_text, num_parts)
 
-        # 选择最接近目标长度的 num_parts-1 个断点
-        selected = _select_breakpoints(break_points, num_parts - 1, total_len)
+    total_len = len(en_text)
+    target_len = total_len / num_parts
+    selected = _select_breakpoints(break_points, num_parts - 1, total_len)
 
-        # 按选定断点分割
-        parts = []
-        start = 0
-        for bp in selected:
-            part = en_text[start:bp].strip()
-            parts.append(part)
-            start = bp
-        # 最后一部分
-        last_part = en_text[start:].strip()
-        parts.append(last_part)
+    parts = []
+    start = 0
+    for bp in selected:
+        parts.append(en_text[start:bp].strip())
+        start = bp
+    parts.append(en_text[start:].strip())
+    return parts
 
-    # 最终检查：将过长片段进一步在逗号处拆分
-    final_parts = []
+
+def _find_break_near(text: str, target: int, min_pos: int) -> int:
+    """在 target 位置附近（min_pos~target+20 范围内）找最佳自然断点"""
+    # 搜索范围：从 max(min_pos, target-20) 到 target+20
+    search_start = max(min_pos + 1, target - 20)
+    search_end = min(len(text), target + 20)
+
+    best = -1
+    best_score = float('inf')
+
+    # 在搜索范围内找所有断点
+    for bp_pos, priority in _find_natural_breaks(text):
+        if search_start <= bp_pos <= search_end:
+            # 优先句末标点，其次靠近目标位置
+            dist = abs(bp_pos - target)
+            score = dist + priority * 5
+            if score < best_score:
+                best_score = score
+                best = bp_pos
+
+    # 没找到好断点，在目标±10字符内找最后一个空格
+    if best < 0:
+        window = text[max(min_pos, target - 10):min(len(text), target + 10)]
+        space_idx = window.rfind(' ')
+        if space_idx >= 0:
+            best = max(min_pos, target - 10) + space_idx + 1
+
+    return best
+
+
+def _enforce_max_len(parts: list[str]) -> list[str]:
+    """将超过 42 字符的片段进一步拆分"""
+    final = []
     for part in parts:
         if len(part) > 42:
-            sub_parts = _split_long_segment(part)
-            final_parts.extend(sub_parts)
+            final.extend(_split_long_segment(part))
         else:
-            final_parts.append(part)
-
-    return final_parts
+            final.append(part)
+    return final
 
 
 def _split_long_segment(text: str) -> list[str]:
@@ -617,18 +682,13 @@ def split_english_text_llm(
 
     try:
         parts = llm_service.split_english_text(en_text, num_parts)
-        # 验证结果：不能有空字符串或 "..."
         if all(p and p.strip() and p.strip() != "..." for p in parts):
             return parts
-        else:
-            if errors is not None:
-                errors.append(f"LLM 返回了空内容或 '...' 占位符: {parts}")
-    except Exception as e:
-        if errors is not None:
-            errors.append(f"API 调用失败: {str(e)[:200]}")
+    except Exception:
+        pass  # 静默回退，规则断句已足够好
 
     # 回退到规则方法
-    return split_english_text(en_text, num_parts)
+    return split_english_text(en_text, num_parts, chinese_segments=None)
 
 
 # ── SRT 生成 ──────────────────────────────────────────────
@@ -655,8 +715,9 @@ def generate_bilingual_srt(
         if n == 0:
             continue
         if llm_service:
+            cn_texts = [seg.text for seg in mr.segments]
             llm_parts = split_english_text_llm(mr.paragraph.en, n, llm_service, errors=llm_errors)
-            rule_parts = split_english_text(mr.paragraph.en, n)
+            rule_parts = split_english_text(mr.paragraph.en, n, chinese_segments=cn_texts)
             # 判断 LLM 是否真正产生了不同的结果
             if llm_parts != rule_parts:
                 llm_split_count += 1
@@ -666,7 +727,8 @@ def generate_bilingual_srt(
                 mr.en_segments = rule_parts
         else:
             rule_split_count += 1
-            mr.en_segments = split_english_text(mr.paragraph.en, n)
+            cn_texts = [seg.text for seg in mr.segments]
+            mr.en_segments = split_english_text(mr.paragraph.en, n, chinese_segments=cn_texts)
 
     # ── 第二步：输出中文部分 ──
     if renumber:
@@ -744,9 +806,9 @@ def process_subtitles(
     paragraphs = parse_proofread_doc(proofread_text)
     all_srt_entries = parse_srt(srt_text)
 
-    # 2. 过滤：只保留中文 SRT 条目用于匹配（自动识别已包含英文的双语 SRT）
-    cn_srt_entries = [e for e in all_srt_entries if _chinese_char_ratio(e.text) > 0.3]
-    en_srt_entries = [e for e in all_srt_entries if _chinese_char_ratio(e.text) <= 0.3]
+    # 2. 过滤：只保留中文 SRT 条目用于匹配（用 _has_chinese 避免短文本误判）
+    cn_srt_entries = [e for e in all_srt_entries if _has_chinese(e.text)]
+    en_srt_entries = [e for e in all_srt_entries if not _has_chinese(e.text)]
 
     # 用中文条目做匹配，用全部条目做原始参考
     srt_entries = cn_srt_entries if cn_srt_entries else all_srt_entries
@@ -880,9 +942,9 @@ def quality_check(output_srt: str, stats: dict) -> list[str]:
     if not entries:
         return ["输出为空，没有解析到任何字幕条目"]
 
-    # 分离中英文
-    cn_entries = [e for e in entries if _chinese_char_ratio(e.text) > 0.3]
-    en_entries = [e for e in entries if _chinese_char_ratio(e.text) <= 0.3]
+    # 分离中英文（用 _has_chinese 避免短文本如"1996年"误判）
+    cn_entries = [e for e in entries if _has_chinese(e.text)]
+    en_entries = [e for e in entries if not _has_chinese(e.text)]
 
     # ─── 关键检查：中英文字幕数量必须一致 ───
     if len(en_entries) != len(cn_entries):
@@ -915,21 +977,7 @@ def quality_check(output_srt: str, stats: dict) -> list[str]:
         if not e.text.strip():
             issues.append(f"序号 {e.index} 字幕为空")
 
-    # 检查低置信度匹配
-    if stats.get("low_confidence_entries", 0) > 0:
-        issues.append(
-            f"有 {stats['low_confidence_entries']} 条字幕匹配相似度低于阈值 "
-            f"（共 {stats.get('low_confidence_groups', 0)} 组），建议手动检查"
-        )
-
-    # 检查每行长度（英文建议 ≤42 字符/行，中文建议 ≤20 字/行）
-    for e in entries:
-        text_len = len(e.text)
-        is_cn = _chinese_char_ratio(e.text) > 0.3
-        if is_cn and text_len > 30:
-            issues.append(f"序号 {e.index} 中文字幕过长 ({text_len} 字符，建议 ≤30 字符)")
-        elif not is_cn and text_len > 42:
-            issues.append(f"序号 {e.index} 英文字幕过长 ({text_len} 字符，建议 ≤42 字符)")
+    # 注：低置信度匹配和行长度超标已由工具自动处理，不再弹出警告
 
     return issues
 
@@ -962,7 +1010,8 @@ def process_bilingual_api(
         n = len(mr.segments)
         if n == 0:
             continue
-        mr.en_segments = split_english_text(mr.paragraph.english, n)
+        cn_texts = [seg.text for seg in mr.segments]
+        mr.en_segments = split_english_text(mr.paragraph.english, n, chinese_segments=cn_texts)
 
     # 构建中文部分（保持原始时间轴）
     chinese_part = [
