@@ -286,8 +286,8 @@ def text_similarity(a: str, b: str) -> float:
     """
     计算两段文本的相似度 (0.0 ~ 1.0)。
 
-    使用 difflib.SequenceMatcher 做字符级比较，
-    同时对中文做特殊处理：忽略口语化虚词。
+    优先使用子串匹配（SRT 中文通常是校对文档中文的连续子串），
+    子串匹配成功直接给高分；否则退回到 difflib 兜底。
     """
     # 清理文本
     a_clean = _normalize_for_matching(a)
@@ -296,6 +296,17 @@ def text_similarity(a: str, b: str) -> float:
     if not a_clean or not b_clean:
         return 0.0
 
+    # 子串优先：短的那段在长的那段里能找到，就是完美匹配
+    shorter = a_clean if len(a_clean) <= len(b_clean) else b_clean
+    longer = b_clean if len(a_clean) <= len(b_clean) else a_clean
+
+    if shorter in longer:
+        # 子串匹配成功，给高分
+        # 归一化：剩余部分的长度越大，分数略低（但不低于 0.7）
+        extra_ratio = 1.0 - (len(longer) - len(shorter)) / len(longer)
+        return max(0.7, extra_ratio)
+
+    # 子串匹配失败，回退到 difflib
     return difflib.SequenceMatcher(None, a_clean, b_clean).ratio()
 
 
