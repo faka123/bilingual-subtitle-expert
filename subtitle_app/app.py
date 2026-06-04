@@ -103,7 +103,56 @@ st.set_page_config(
     page_title="双语字幕精确排版专家",
     page_icon="🎬",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
+
+# ── 登录认证 ──────────────────────────────────────────────
+
+def check_password() -> bool:
+    """简单密码认证，已登录则跳过"""
+
+    if st.session_state.get("authenticated"):
+        return True
+
+    # 从 secrets 或环境变量读取密码（云部署用 st.secrets，本地用环境变量）
+    import os
+    _password = os.environ.get("APP_PASSWORD", "")
+    try:
+        _password = _password or st.secrets.get("APP_PASSWORD", "")
+    except Exception:
+        pass
+
+    # 未设置密码时允许直接进入
+    if not _password:
+        st.session_state["authenticated"] = True
+        return True
+
+    # 登录表单
+    st.markdown("""
+    <style>
+    .login-box {
+        max-width: 400px; margin: 10vh auto; padding: 2rem;
+        border: 1px solid #ddd; border-radius: 12px; text-align: center;
+    }
+    </style>
+    <div class="login-box">
+        <h1>🎬 双语字幕排版</h1>
+        <p style="color:#888">内部工具，请输入访问密码</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    pwd = st.text_input("密码", type="password", placeholder="输入访问密码", key="login_pwd", label_visibility="collapsed")
+    if st.button("🔑 登录", use_container_width=True):
+        if pwd == _password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("密码错误")
+    return False
+
+
+if not check_password():
+    st.stop()
 
 # ── 样式 ──────────────────────────────────────────────────
 
