@@ -1,0 +1,23 @@
+name: Keep Streamlit App Awake
+
+on:
+  schedule:
+    # 每 5 分钟运行一次（UTC 时间）
+    - cron: '*/5 * * * *'
+  # 也允许手动触发
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Streamlit App
+        run: |
+          echo "🔄 正在唤醒 shuangyu.streamlit.app ..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://shuangyu.streamlit.app/?embed=true")
+          echo "📡 响应状态: HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ 应用正常运行中"
+          else
+            echo "⚠️ 收到非预期状态码: $HTTP_CODE，但请求已送达"
+          fi
