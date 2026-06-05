@@ -13,14 +13,6 @@ from core import (
 )
 from llm import create_llm_service
 
-# ── 国旗图片 ──────────────────────────────────────────────
-
-# 台湾国旗 (去底 PNG base64)
-try:
-    from flags import TW_FLAG_B64
-except ImportError:
-    TW_FLAG_B64 = None
-
 # ── LLM 提供商配置（定义在 app.py 以避免跨模块导入问题）──
 
 LLM_PROVIDERS = {
@@ -508,23 +500,28 @@ if st.session_state.get("processed"):
 
     output_srt = st.session_state.get("output_srt", "")
 
-    # 中文/英文分离显示
-    # ── 自定义标签页（含国旗图片）──
-    TW_FLAG_IMG = f'<img src="data:image/png;base64,{TW_FLAG_B64}" width="24" style="vertical-align:middle;margin-right:6px">' if TW_FLAG_B64 else ""
-
-    tab1, tab2, tab3 = st.tabs(["📋 完整输出", "中文部分", "英文部分"])
-
     srt_entries = parse_srt(output_srt)
 
     # 分离中英文
     cn_entries = [e for e in srt_entries if _has_chinese(e.text)]
     en_entries = [e for e in srt_entries if not _has_chinese(e.text)]
 
+    # ── 标签页 ──
+    from flags import TW_FLAG_B64
+
+    tab1, tab2, tab3 = st.tabs(["📋 完整输出", "中文部分", "英文部分"])
+
+    # 台湾国旗（透明底 PNG）
+    tw_flag_img = (
+        f'<img src="data:image/png;base64,{TW_FLAG_B64}" width="28"'
+        f' style="vertical-align:middle;margin-right:6px;border-radius:2px;">'
+    )
+
     with tab1:
         st.code(output_srt, language="text")
 
     with tab2:
-        st.markdown(f"{TW_FLAG_IMG} **台湾**", unsafe_allow_html=True)
+        st.markdown(f"### {tw_flag_img} 中文部分（台湾）", unsafe_allow_html=True)
         if cn_entries:
             cn_text = "\n\n".join(
                 f"{e.index}\n{e.start_time} --> {e.end_time}\n{e.text}"
@@ -536,7 +533,7 @@ if st.session_state.get("processed"):
             st.info("未检测到中文字幕")
 
     with tab3:
-        st.markdown("🇺🇸 **美国**")
+        st.markdown("### 🇺🇸 英文部分（美国）")
         if en_entries:
             en_text = "\n\n".join(
                 f"{e.index}\n{e.start_time} --> {e.end_time}\n{e.text}"
