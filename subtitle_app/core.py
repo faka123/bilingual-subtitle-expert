@@ -953,9 +953,17 @@ def quality_check(output_srt: str, stats: dict) -> list[str]:
     if not entries:
         return ["输出为空，没有解析到任何字幕条目"]
 
-    # 分离中英文（用 _has_chinese 避免短文本如"1996年"误判）
-    cn_entries = [e for e in entries if _has_chinese(e.text)]
-    en_entries = [e for e in entries if not _has_chinese(e.text)]
+    # ── 分离中英文 ──
+    # 不再用 _has_chinese() 判断（英文翻译中可能含中文地名如"沈阳"导致误判），
+    # 改为按输出结构拆分：前 N 条为中文，其余为英文。
+    cn_count = stats.get("srt_entries", 0)
+    if cn_count > 0 and cn_count < len(entries):
+        cn_entries = entries[:cn_count]
+        en_entries = entries[cn_count:]
+    else:
+        # 兜底：无法按数量拆分时，回退到 _has_chinese 判断
+        cn_entries = [e for e in entries if _has_chinese(e.text)]
+        en_entries = [e for e in entries if not _has_chinese(e.text)]
 
     # ─── 关键检查：中英文字幕数量必须一致 ───
     if len(en_entries) != len(cn_entries):
