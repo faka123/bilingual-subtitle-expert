@@ -501,7 +501,7 @@ if st.session_state.get("processed"):
     output_srt = st.session_state.get("output_srt", "")
 
     # 中文/英文分离显示
-    tab1, tab2, tab3 = st.tabs(["📋 完整输出", "🇨🇳 中文部分", "🇬🇧 英文部分"])
+    tab1, tab2, tab3 = st.tabs(["📋 完整输出", "🇹🇼 中文部分", "🇺🇸 英文部分"])
 
     srt_entries = parse_srt(output_srt)
 
