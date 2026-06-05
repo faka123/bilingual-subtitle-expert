@@ -506,46 +506,13 @@ if st.session_state.get("processed"):
     cn_entries = [e for e in srt_entries if _has_chinese(e.text)]
     en_entries = [e for e in srt_entries if not _has_chinese(e.text)]
 
-    # ── 自定义标签栏（HTML+JS，可嵌入国旗图片）──
-    from flags import TW_FLAG_B64
+    # ── 标签页 ──
+    tab1, tab2, tab3 = st.tabs(["📋 完整输出", "🇨🇳 中文部分", "🇺🇸 英文部分"])
 
-    # 读取当前选中的标签页
-    tab = st.query_params.get("tab", "0")
-    tab_idx = int(tab) if tab in ("0", "1", "2") else 0
-
-    tw_img = f"data:image/png;base64,{TW_FLAG_B64}"
-
-    st.markdown(f"""
-    <style>
-    .flag-tab-bar {{ display:flex; gap:4px; margin-bottom:6px; }}
-    .flag-tab-bar button {{
-        flex:1; padding:10px 8px; border:1px solid #ccc; border-radius:8px;
-        background:#f0f2f6; cursor:pointer; font-size:14px; font-weight:500;
-        transition:all 0.15s; white-space:nowrap;
-    }}
-    .flag-tab-bar button:hover {{ background:#e0e2e6; }}
-    .flag-tab-bar button.active {{
-        background:#fff; border:2px solid #ff4b4b; color:#ff4b4b; font-weight:700;
-    }}
-    .flag-tab-bar button img {{ width:22px; vertical-align:middle; margin-right:4px; border-radius:2px; }}
-    .flag-tab-bar button .emoji {{ font-size:18px; vertical-align:middle; margin-right:4px; }}
-    </style>
-    <div class="flag-tab-bar">
-        <button onclick="location.href='?tab=0'" class="{'active' if tab_idx == 0 else ''}">📋 完整输出</button>
-        <button onclick="location.href='?tab=1'" class="{'active' if tab_idx == 1 else ''}">
-            <img src="{tw_img}">中文部分
-        </button>
-        <button onclick="location.href='?tab=2'" class="{'active' if tab_idx == 2 else ''}">
-            <span class="emoji">🇺🇸</span>英文部分
-        </button>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── 标签内容 ──
-    if tab_idx == 0:
+    with tab1:
         st.code(output_srt, language="text")
 
-    elif tab_idx == 1:
+    with tab2:
         if cn_entries:
             cn_text = "\n\n".join(
                 f"{e.index}\n{e.start_time} --> {e.end_time}\n{e.text}"
@@ -556,7 +523,7 @@ if st.session_state.get("processed"):
         else:
             st.info("未检测到中文字幕")
 
-    elif tab_idx == 2:
+    with tab3:
         if en_entries:
             en_text = "\n\n".join(
                 f"{e.index}\n{e.start_time} --> {e.end_time}\n{e.text}"
