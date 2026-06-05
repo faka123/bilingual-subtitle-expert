@@ -507,21 +507,12 @@ if st.session_state.get("processed"):
     en_entries = [e for e in srt_entries if not _has_chinese(e.text)]
 
     # ── 标签页 ──
-    from flags import TW_FLAG_B64
-
-    tab1, tab2, tab3 = st.tabs(["📋 完整输出", "中文部分", "英文部分"])
-
-    # 台湾国旗（透明底 PNG）
-    tw_flag_img = (
-        f'<img src="data:image/png;base64,{TW_FLAG_B64}" width="28"'
-        f' style="vertical-align:middle;margin-right:6px;border-radius:2px;">'
-    )
+    tab1, tab2, tab3 = st.tabs(["📋 完整输出", "🇹🇼 中文部分", "🇺🇸 英文部分"])
 
     with tab1:
         st.code(output_srt, language="text")
 
     with tab2:
-        st.markdown(f"### {tw_flag_img} 中文部分（台湾）", unsafe_allow_html=True)
         if cn_entries:
             cn_text = "\n\n".join(
                 f"{e.index}\n{e.start_time} --> {e.end_time}\n{e.text}"
@@ -533,7 +524,6 @@ if st.session_state.get("processed"):
             st.info("未检测到中文字幕")
 
     with tab3:
-        st.markdown("### 🇺🇸 英文部分（美国）")
         if en_entries:
             en_text = "\n\n".join(
                 f"{e.index}\n{e.start_time} --> {e.end_time}\n{e.text}"
