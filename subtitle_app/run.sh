@@ -5,10 +5,10 @@ VENV_PYTHON="../venv/bin/python"
 echo "🎬 启动双语字幕精确排版专家..."
 echo ""
 
-# 安装缺失依赖
+# 安装缺失依赖（使用清华镜像加速）
 $VENV_PYTHON -c "import streamlit" 2>/dev/null || {
     echo "⏳ 正在安装依赖..."
-    $VENV_PYTHON -m pip install streamlit python-docx openai anthropic -q
+    $VENV_PYTHON -m pip install streamlit python-docx openai anthropic -q -i https://pypi.tuna.tsinghua.edu.cn/simple
     echo "✅ 完成"
 }
 
