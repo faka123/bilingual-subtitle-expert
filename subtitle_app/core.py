@@ -422,7 +422,7 @@ def match_segments_to_paragraphs(
 
 # ── 英文断句 ──────────────────────────────────────────────
 
-def split_english_text(en_text: str, num_parts: int, chinese_segments: list[str] | None = None) -> list[str]:
+def split_english_text(en_text: str, num_parts: int, chinese_segments: Optional[list[str]] = None) -> list[str]:
     """
     将英文段落按中文断句比例分割，长的中文配长的英文，短的配短的。
 
@@ -719,8 +719,8 @@ def split_english_text_llm(
     en_text: str,
     num_parts: int,
     llm_service,
-    chinese_segments: list[str] | None = None,
-    errors: list | None = None,
+    chinese_segments: Optional[list[str]] = None,
+    errors: Optional[list] = None,
 ) -> list[str]:
     """
     用 LLM 按语义自然断句，失败时回退到规则方法。
