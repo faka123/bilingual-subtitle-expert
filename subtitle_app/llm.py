@@ -77,13 +77,13 @@ class LLMService:
 
 ## Core Rules (from 《双语字幕精确排版专家 - 完整规则手册》):
 
-1. **行数一致**: The number of English parts MUST equal {num_parts} exactly — one-to-one correspondence with Chinese segments
-2. **自然断点**: Split at natural pause points — periods (.), semicolons (;), commas (,) — in that priority order
-3. **不拆短语**: Never split a complete phrase, collocation, or semantic unit across two parts. For example, keep "the dreams and struggles" together
-4. **内容完整**: Every word from the original English text must appear in exactly one part — nothing omitted, nothing repeated
-5. **禁止占位**: Never output "..." or "[...]" or empty strings — every part must contain real, readable English text
-6. **每行长度**: Keep each part under 42 characters when possible, but prioritize rule #3 (don't split phrases) over strict length limits
-7. **禁止跨段**: All splits must stay within this single paragraph — do not reference or mix with other content
+**CRITICAL — Rule Priority Order (higher number = higher priority):**
+- Level 10 (HIGHEST): **内容完整** — Every word from the original English text MUST appear in the output exactly once. ZERO omissions, ZERO additions. If you can't satisfy all constraints, sacrifice line length FIRST, then split-position quality, then exact part count — but NEVER drop text.
+- Level 9: **不拆短语** — Never split a complete phrase, collocation, or semantic unit across two parts. Keep "the dreams and struggles" together.
+- Level 8: **禁止占位** — Never output "..." or "[...]" or empty strings — every part must contain real, readable English text.
+- Level 7: **自然断点** — Split at natural pause points — periods (.), semicolons (;), commas (,) — in that priority order.
+- Level 6: **行数一致** — The number of English parts should equal {num_parts}. However, if the English text is long and won't fit into {num_parts} parts without violating higher-priority rules, output MORE than {num_parts} parts — the application will merge the overflow safely. If it's short, you may output fewer — the app will duplicate the last part.
+- Level 5 (LOWEST): **每行长度** — Try to keep each part under 42 characters, but this is a soft target. Long segments (50-80+ chars) are ACCEPTABLE if needed to preserve content integrity or phrase unity.
 
 ## English text to split:
 {en_text}
@@ -91,7 +91,7 @@ class LLMService:
 Return ONLY a JSON object:
 {{"parts": ["part 1 text", "part 2 text", ...]}}
 
-The array must have exactly {num_parts} elements. Output JSON only, no other text."""
+The array should ideally have {num_parts} elements. Output JSON only, no other text."""
 
         try:
             result_text = self._call_api(prompt, max_tokens=1024)
@@ -100,11 +100,13 @@ The array must have exactly {num_parts} elements. Output JSON only, no other tex
             if len(parts) == num_parts:
                 return parts
             elif len(parts) > num_parts:
+                # 多出的段合并到最后一段（确保内容不丢失）
                 merged = parts[:num_parts - 1]
                 merged.append(" ".join(parts[num_parts - 1:]))
                 return merged
             else:
-                return parts + [""] * (num_parts - len(parts))
+                # 段数不够：复用最后一段（好过空字符串）
+                return parts + [parts[-1]] * (num_parts - len(parts))
 
         except Exception as e:
             raise RuntimeError(f"LLM 英文断句失败: {e}") from e

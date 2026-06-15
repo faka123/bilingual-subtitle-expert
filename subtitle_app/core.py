@@ -430,20 +430,34 @@ def split_english_text(en_text: str, num_parts: int, chinese_segments: list[str]
     1. 按中文段落长度比例分配英文字符数
     2. 在分配的位置附近找自然断点
     3. 单段超过 42 字符的进一步拆分
+
+    **关键约束：绝不丢失任何英文内容。** 如果 _enforce_max_len 拆分导致
+    段数超过 num_parts，多出的段合并回最后一段（宁可超长，不可丢失）。
     """
     if num_parts <= 1:
-        return _enforce_max_len([en_text])
+        return [en_text]
 
     if chinese_segments and len(chinese_segments) == num_parts:
-        return _split_proportional(en_text, chinese_segments)
+        parts = _split_proportional(en_text, chinese_segments)
+    else:
+        # 无中文参考时，回退到均匀分割
+        parts = _split_uniform(en_text, num_parts)
+        parts = _enforce_max_len(parts)
 
-    # 无中文参考时，回退到均匀分割
-    parts = _split_uniform(en_text, num_parts)
-    return _enforce_max_len(parts)
+    # ── 确保段数精确等于 num_parts：宁可超长，绝不丢失 ──
+    if len(parts) > num_parts:
+        # 将多余段合并回最后一段，保留全部英文内容
+        overflow = " ".join(parts[num_parts - 1:])
+        parts = parts[:num_parts - 1] + [overflow]
+    elif len(parts) < num_parts:
+        # 段数不够时，复用最后一段内容（好过空字符串或 [MISSING]）
+        parts.extend([parts[-1]] * (num_parts - len(parts)))
+
+    return parts
 
 
 def _split_proportional(en_text: str, cn_segments: list[str]) -> list[str]:
-    """按中文段长度比例分割英文"""
+    """按中文段长度比例分割英文。不强制截断（长度约束由调用方在段数保护下处理）。"""
     # 计算每个中文段的长度（去标点后的字符数）
     cn_lens = [len(_normalize_for_matching(s)) for s in cn_segments]
     total_cn = sum(cn_lens)
@@ -474,7 +488,8 @@ def _split_proportional(en_text: str, cn_segments: list[str]) -> list[str]:
                 parts.append(en_text[start:target_pos].strip())
                 start = target_pos
 
-    return _enforce_max_len(parts)
+    # 对中间段做长度约束（允许轻微超长，但拆分后段数不能超过 num_parts）
+    return _enforce_max_len_with_limit(parts, max_parts=len(cn_segments))
 
 
 def _split_uniform(en_text: str, num_parts: int) -> list[str]:
@@ -528,13 +543,37 @@ def _find_break_near(text: str, target: int, min_pos: int) -> int:
 
 
 def _enforce_max_len(parts: list[str]) -> list[str]:
-    """将超过 42 字符的片段进一步拆分"""
+    """将超过 42 字符的片段进一步拆分（无段数上限保护）。"""
     final = []
     for part in parts:
         if len(part) > 42:
             final.extend(_split_long_segment(part))
         else:
             final.append(part)
+    return final
+
+
+def _enforce_max_len_with_limit(parts: list[str], max_parts: int) -> list[str]:
+    """将超过 42 字符的片段拆分，但确保总段数不超过 max_parts。
+
+    如果拆分会使段数膨胀到超过 max_parts，则放弃拆分该段，
+    保留为超长段（宁可超长，不可丢失内容）。
+    """
+    final = []
+    budget = max_parts - len(parts)  # 可额外增加的段数
+
+    for part in parts:
+        if len(part) > 42 and budget > 0:
+            split = _split_long_segment(part)
+            if len(split) > 1:
+                extra = len(split) - 1  # 拆分带来的额外段数
+                if extra <= budget:
+                    final.extend(split)
+                    budget -= extra
+                    continue
+                # 不够预算拆，放弃拆分 — 保留超长段，不丢内容
+        final.append(part)
+
     return final
 
 
@@ -680,26 +719,38 @@ def split_english_text_llm(
     en_text: str,
     num_parts: int,
     llm_service,
-    errors=None,
+    chinese_segments: list[str] | None = None,
+    errors: list | None = None,
 ) -> list[str]:
     """
     用 LLM 按语义自然断句，失败时回退到规则方法。
 
     当 LLM 调用失败或结果无效时，自动回退到现有的 split_english_text，
     并将错误信息记录到 errors 列表中。
+
+    **内容完整性保护**：无论 LLM 路径还是回退路径，都会确保英文字段总数
+    不超过 num_parts（多出的合并），不丢失任何英文原文。
     """
     if num_parts <= 1:
         return [en_text]
 
     try:
         parts = llm_service.split_english_text(en_text, num_parts)
+        # 验证结果有效性：每个部分都有实际文本
         if all(p and p.strip() and p.strip() != "..." for p in parts):
+            # 作为内容完整性验证，检查每段的单词是否都在原文中
+            en_words_lower = set(en_text.lower().split())
+            for p in parts:
+                p_words = set(p.lower().split())
+                if not p_words.issubset(en_words_lower):
+                    # LLM 可能捏造了内容，回退到规则算法
+                    raise ValueError("LLM 输出包含原文不存在的单词，回退到规则算法")
             return parts
     except Exception:
         pass  # 静默回退，规则断句已足够好
 
-    # 回退到规则方法
-    return split_english_text(en_text, num_parts, chinese_segments=None)
+    # 回退到规则方法（使用中文段长度参考提升断句质量）
+    return split_english_text(en_text, num_parts, chinese_segments=chinese_segments)
 
 
 # ── SRT 生成 ──────────────────────────────────────────────
@@ -727,7 +778,7 @@ def generate_bilingual_srt(
             continue
         if llm_service:
             cn_texts = [seg.text for seg in mr.segments]
-            llm_parts = split_english_text_llm(mr.paragraph.en, n, llm_service, errors=llm_errors)
+            llm_parts = split_english_text_llm(mr.paragraph.en, n, llm_service, chinese_segments=cn_texts, errors=llm_errors)
             rule_parts = split_english_text(mr.paragraph.en, n, chinese_segments=cn_texts)
             # 判断 LLM 是否真正产生了不同的结果
             if llm_parts != rule_parts:
@@ -766,6 +817,13 @@ def generate_bilingual_srt(
     english_index = max_cn_index + 1
 
     for mr in sorted(results, key=lambda r: r.segments[0].index if r.segments else float('inf')):
+        # 安全网：如果 en_segments 多于 segments，合并多余的段到最后一段
+        seg_count = len(mr.segments)
+        en_count = len(mr.en_segments)
+        if en_count > seg_count and seg_count > 0:
+            overflow = " ".join(mr.en_segments[seg_count - 1:])
+            mr.en_segments = mr.en_segments[:seg_count - 1] + [overflow]
+
         for i, seg in enumerate(mr.segments):
             if i < len(mr.en_segments):
                 en_text = mr.en_segments[i]
