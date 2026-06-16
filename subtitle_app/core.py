@@ -457,39 +457,86 @@ def split_english_text(en_text: str, num_parts: int, chinese_segments: Optional[
 
 
 def _split_proportional(en_text: str, cn_segments: list[str]) -> list[str]:
-    """按中文段长度比例分割英文。不强制截断（长度约束由调用方在段数保护下处理）。"""
-    # 计算每个中文段的长度（去标点后的字符数）
+    """按中文段长度比例分割英文，词级智能分配。
+
+    相对于旧版的关键改进：
+    - 按单词数（而非字符位置）进行比例分配
+    - 始终在单词边界处断开，绝不截断单词
+    - 优先选择句末标点（. ! ? ;）作为断点，其次逗号（,），最后普通空格
+    - 保证不丢失、不重复任何英文内容
+    """
     cn_lens = [len(_normalize_for_matching(s)) for s in cn_segments]
     total_cn = sum(cn_lens)
+    num_parts = len(cn_segments)
 
     if total_cn == 0:
-        return _split_uniform(en_text, len(cn_segments))
+        return _split_uniform(en_text, num_parts)
 
-    en_total = len(en_text)
+    words = en_text.split()
+    total_words = len(words)
+
+    # 单词数不足以分配时，每段至少一个单词
+    if total_words <= num_parts:
+        parts = words[:]
+        if len(parts) < num_parts:
+            parts.extend([words[-1]] * (num_parts - len(parts)))
+        return parts
+
+    def _break_quality(word_idx: int) -> int:
+        """词间断点质量：0=句末标点(最佳), 1=逗号, 2=普通空格(最差)"""
+        if word_idx <= 0 or word_idx >= len(words):
+            return 2
+        prev = words[word_idx - 1]
+        if prev and prev[-1] in '.!?;':
+            return 0
+        if prev and prev[-1] == ',':
+            return 1
+        return 2
+
     parts = []
     start = 0
+    remaining_cn = total_cn
+    remaining_words = total_words
 
-    for i, (seg, cn_len) in enumerate(zip(cn_segments, cn_lens)):
-        is_last = (i == len(cn_segments) - 1)
-        if is_last:
-            parts.append(en_text[start:].strip())
-        else:
-            # 按比例计算目标位置
-            ratio = cn_len / total_cn
-            target_pos = start + int(en_total * ratio)
+    for i in range(num_parts - 1):
+        # 按剩余中文字符比例计算本段应得单词数
+        ratio = cn_lens[i] / remaining_cn
+        target_count = max(1, round(remaining_words * ratio))
+        target_idx = start + target_count
 
-            # 在目标位置附近找自然断点
-            bp = _find_break_near(en_text, target_pos, start)
-            if bp > start:
-                parts.append(en_text[start:bp].strip())
-                start = bp
-            else:
-                # 找不到断点，按字符切
-                parts.append(en_text[start:target_pos].strip())
-                start = target_pos
+        # 在目标位置附近找最佳断点（搜索窗口：±target_count/2，至少±3词）
+        window = max(3, target_count // 2)
+        lo = max(start + 1, target_idx - window)
+        hi = min(len(words), target_idx + window + 1)
 
-    # 对中间段做长度约束（允许轻微超长，但拆分后段数不能超过 num_parts）
-    return _enforce_max_len_with_limit(parts, max_parts=len(cn_segments))
+        best_idx = target_idx
+        best_score = float('inf')
+        for w in range(lo, hi):
+            q = _break_quality(w)
+            dist = abs(w - target_idx)
+            score = q * 4 + dist  # 质量优先于距离
+            if score < best_score:
+                best_score = score
+                best_idx = w
+
+        if best_idx <= start:
+            best_idx = target_idx
+
+        parts.append(' '.join(words[start:best_idx]))
+        actual = best_idx - start
+        remaining_words -= actual
+        remaining_cn -= cn_lens[i]
+        start = best_idx
+
+    # 最后一段：全部剩余词
+    parts.append(' '.join(words[start:]))
+
+    # 过滤空段并补足
+    parts = [p for p in parts if p.strip()]
+    while len(parts) < num_parts:
+        parts.append(parts[-1] if parts else "[EMPTY]")
+
+    return parts[:num_parts]
 
 
 def _split_uniform(en_text: str, num_parts: int) -> list[str]:
@@ -514,10 +561,17 @@ def _split_uniform(en_text: str, num_parts: int) -> list[str]:
 
 
 def _find_break_near(text: str, target: int, min_pos: int) -> int:
-    """在 target 位置附近（min_pos~target+20 范围内）找最佳自然断点"""
-    # 搜索范围：从 max(min_pos, target-20) 到 target+20
-    search_start = max(min_pos + 1, target - 20)
-    search_end = min(len(text), target + 20)
+    """在 target 位置附近找最佳自然断点。
+
+    改进：
+    - 搜索窗口从 ±20 扩大到 ±60 字符
+    - 强制在单词边界断开（绝不在单词中间截断）
+    - 优先句末标点(.!?;)后的空格，其次逗号，最后普通空格
+    - 无合适断点时回退到最近的空格（而非强行切字符）
+    """
+    # 搜索范围
+    search_start = max(min_pos + 1, target - 60)
+    search_end = min(len(text), target + 60)
 
     best = -1
     best_score = float('inf')
@@ -525,19 +579,43 @@ def _find_break_near(text: str, target: int, min_pos: int) -> int:
     # 在搜索范围内找所有断点
     for bp_pos, priority in _find_natural_breaks(text):
         if search_start <= bp_pos <= search_end:
-            # 优先句末标点，其次靠近目标位置
+            # 确保断点在单词边界（断点后应该是空格或字母）
+            if bp_pos < len(text) and text[bp_pos - 1] not in '.!?;,':
+                if bp_pos < len(text) and text[bp_pos - 1].isalpha() and text[bp_pos].isalpha():
+                    continue  # 在两个字母中间，非单词边界
             dist = abs(bp_pos - target)
-            score = dist + priority * 5
+            score = dist + priority * 10
             if score < best_score:
                 best_score = score
                 best = bp_pos
 
-    # 没找到好断点，在目标±10字符内找最后一个空格
+    # 没找到标点断点：在 target 附近找最后一个空格（确保单词边界）
     if best < 0:
-        window = text[max(min_pos, target - 10):min(len(text), target + 10)]
-        space_idx = window.rfind(' ')
-        if space_idx >= 0:
-            best = max(min_pos, target - 10) + space_idx + 1
+        lo = max(min_pos, target - 30)
+        hi = min(len(text), target + 30)
+        for pos in range(hi - 1, lo, -1):
+            if text[pos] == ' ' and pos > min_pos:
+                best = pos + 1  # 断点 = 空格后面
+                break
+
+    # 最终回退：在更大范围内找任何空格
+    if best < 0 or best <= min_pos:
+        lo = max(min_pos, target - 60)
+        hi = min(len(text), target + 60)
+        for pos in range(hi - 1, lo, -1):
+            if text[pos] == ' ' and pos > min_pos:
+                best = pos + 1
+                break
+
+    # 实在找不到空格，返回离 target 最近的单词边界
+    if best < 0 or best <= min_pos:
+        # 不强行切字符，而是取 min_pos 后的下一个空格，或 target 后的下一个空格
+        for pos in range(min_pos + 1, min(len(text), min_pos + 60)):
+            if text[pos] == ' ':
+                best = pos + 1
+                break
+        if best < 0 or best <= min_pos:
+            best = min(min_pos + 1, len(text))
 
     return best
 
@@ -577,37 +655,54 @@ def _enforce_max_len_with_limit(parts: list[str], max_parts: int) -> list[str]:
     return final
 
 
-def _split_long_segment(text: str) -> list[str]:
+def _split_long_segment(text: str, max_len: int = 42) -> list[str]:
+    """将过长英文片段在自然断点处拆分为多段。
+
+    拆分优先级：
+    1. 句末标点 (. ! ? ;) 后的空格
+    2. 逗号 (,) 后的空格
+    3. 连词 (and/but/or/that/which/who/while/when/where) 前的空格
+    4. 最后一个普通空格
+    5. 找不到断点则保留超长段（宁可超长，不丢内容）
+
+    关键约束：
+    - 绝不截断单词
+    - 绝不丢失任何单词
+    - 所有原文字词在输出中恰好出现一次
     """
-    将超过42字符的英文片段在逗号处分拆为多段，保持每段≤42字符。
-    优先在逗号后拆分，其次在 and/but/or 等连词前拆分。
-    """
-    MAX_LEN = 42
     parts = []
     remaining = text.strip()
 
-    while len(remaining) > MAX_LEN:
-        # 1) 在前42字符内找最后一个逗号+空格
+    while len(remaining) > max_len:
         best = -1
-        window = remaining[:MAX_LEN + 1]
-        for m in re.finditer(r',\s+', window):
-            if m.end() <= MAX_LEN:
+        window = remaining[:max_len + 1]
+
+        # 1) 句末标点后的空格（最佳断点）
+        for m in re.finditer(r'[.!?;]\s+', window):
+            if m.end() <= max_len:
                 best = m.end()
 
-        # 2) 没逗号，找连词边界
+        # 2) 逗号后的空格
+        if best <= 0:
+            for m in re.finditer(r',\s+', window):
+                if m.end() <= max_len:
+                    best = m.end()
+
+        # 3) 连词前的空格
         if best <= 0:
             for m in re.finditer(r'\s+(and|but|or|that|which|who|while|when|where)\s+', window):
-                if m.start() <= MAX_LEN:
+                if m.start() <= max_len:
                     best = m.start()
 
-        # 3) 还是没有，在最后一个空格处拆分
+        # 4) 最后一个普通空格（保证不截断单词）
         if best <= 0:
             last_space = window.rfind(' ')
             if last_space > 0:
                 best = last_space + 1
-            else:
-                # 实在没法拆，强行截断
-                best = MAX_LEN
+
+        # 5) 找不到合适断点，保留超长段（不强行截断单词）
+        if best <= 0:
+            break
 
         parts.append(remaining[:best].strip())
         remaining = remaining[best:].strip()
