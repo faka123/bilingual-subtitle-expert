@@ -422,6 +422,173 @@ def match_segments_to_paragraphs(
 
 # ── 英文断句 ──────────────────────────────────────────────
 
+# ── 常见英文缩写（不以句号结尾即句子结束）────
+_KNOWN_ABBREVIATIONS = {
+    # 称谓
+    'mr', 'mrs', 'ms', 'miss', 'dr', 'prof', 'sr', 'jr', 'st',
+    # 公司/组织
+    'corp', 'inc', 'ltd', 'co', 'bros',
+    # 常见缩写
+    'vs', 'etc', 'dept', 'est', 'approx', 'appt', 'no',
+    # 拉丁缩略
+    'e.g', 'i.e', 'et al', 'viz',
+    # 地址/州名
+    'ave', 'blvd', 'rd', 'st',  # st 与上面的 st 冲突但无所谓
+    # 度量
+    'ft', 'in', 'lbs', 'oz', 'gal', 'vol',
+    # 其他
+    'misc', 'dept', 'govt', 'assn',
+}
+
+# ── 常见连词（断句时可优先在此处分割）──
+_CONJUNCTIONS = {
+    'and', 'but', 'or', 'so', 'yet', 'nor', 'for',
+    'because', 'although', 'though', 'if', 'when', 'while',
+    'where', 'which', 'that', 'who', 'whom', 'whose',
+    'after', 'before', 'since', 'until', 'unless', 'whereas',
+    'whereby', 'wherein', 'whereupon',
+}
+
+
+def _is_abbreviation(word: str) -> bool:
+    """判断一个以 . 结尾的单词是否为常见缩写（不是句子结束）。
+
+    检查去掉末尾 . 后的小写形式是否在已知缩写列表中。
+    额外保护：单字母加点（如 "A." 代表 A 某人）不是句子结束，
+    但通常已包含在列表中。
+    """
+    if not word.endswith('.'):
+        return False
+    stem = word[:-1].lower().strip()
+    if len(stem) == 0:
+        return False
+    if stem in _KNOWN_ABBREVIATIONS:
+        return True
+    # 单大写字母加点通常是缩写（如 "A."、"B."）
+    if len(stem) == 1 and stem.isalpha():
+        return True
+    return False
+
+
+def _is_sentence_end(word: str, next_word: Optional[str] = None) -> bool:
+    """判断一个以 . ! ? 结尾的单词是否真的是句子结束。
+
+    - 缩写（Mr./Dr./etc.）不算句子结束
+    - 如果下一个单词首字母大写，更可能是句子结束
+    """
+    if word.endswith('!'):
+        return True
+    if word.endswith('?'):
+        return True
+    if word.endswith('.'):
+        if _is_abbreviation(word):
+            return False
+        # 额外确认：如果下一个词不是大写开头，可能不是句子结束
+        # （但 "." 在文本中也可能是列表编号等，保守处理）
+        return True
+    return False
+
+
+def _extract_word_breakpoints(words: list[str]) -> list[tuple[int, int]]:
+    """从单词列表中提取所有自然断点位置，返回 [(word_index, quality), ...]。
+
+    word_index 表示在此处断开（words[:idx] 为前一段，words[idx:] 为后一段）。
+
+    断点质量分级：
+    - 4 级：句末标点 . ! ? 后（确认非缩写，下一个单词首字母大写优先）
+    - 3 级：分号 ; 冒号 : 破折号 —
+    - 2 级：逗号 ,
+    - 1 级：连词前（and/but/or/so/because/if/when/while/where/which/that/who 等）
+    - 0 级：任意单词边界（每两个单词之间）
+
+    注意：断点排在连词**前面**（不包含连词在当前段尾），
+    与 _split_long_segment 中的连词位置处理一致。
+    """
+    breakpoints = []
+    n = len(words)
+
+    for i in range(1, n):
+        prev_word = words[i - 1]
+        curr_word = words[i]
+        quality = -1  # 不是有意义的断点
+
+        # 4 级：句末标点（确认非缩写）
+        if prev_word.endswith('.'):
+            if not _is_abbreviation(prev_word):
+                # 进一步确认：下一个单词小写开头可能是非标准句号（如数字列表"1."）
+                if curr_word and curr_word[0].isupper() if curr_word else True:
+                    quality = 4
+                else:
+                    quality = 2  # 降级为逗号级（可能是列表序号等）
+        elif prev_word.endswith('!'):
+            quality = 4
+        elif prev_word.endswith('?'):
+            quality = 4
+        # 3 级：分号/冒号/破折号
+        elif prev_word.endswith(';'):
+            quality = 3
+        elif prev_word.endswith(':'):
+            quality = 3
+        elif prev_word == '—' or prev_word.endswith('—'):
+            quality = 3
+        # 2 级：逗号
+        elif prev_word.endswith(','):
+            quality = 2
+        # 1 级：连词前 — 断在连词前面（让连词归入下一段）
+        elif curr_word.lower().rstrip(',.;:!?') in _CONJUNCTIONS:
+            quality = 1
+        # 0 级：任意单词边界
+        else:
+            quality = 0
+
+        if quality >= 0:
+            breakpoints.append((i, quality))
+
+    return breakpoints
+
+
+def _find_best_breakpoint(
+    breakpoints: list[tuple[int, int]],
+    target_idx: int,
+    lo_idx: int,
+    hi_idx: int,
+    total_words: int,
+    remaining_segments: int,
+    min_words: int = 1,
+) -> int:
+    """在 [lo_idx, hi_idx] 范围内找最佳断点。
+
+    返回最佳的 word_index，如果范围内无合适断点则返回 target_idx。
+
+    评分公式: score = quality * 0.15 + (1.0 - abs(idx - target) / max_range) * 0.85
+    - 质量权重 15%，距离权重 85%（让含义对齐优先于长度精确）
+
+    边界约束：
+    - idx >= lo_idx（前段至少 min_words 词）
+    - idx <= total_words - min_words * remaining_segments（后段至少留够）
+    """
+    max_range = max(abs(target_idx - lo_idx), abs(hi_idx - target_idx), 1)
+
+    best_idx = target_idx
+    best_score = -999.0
+
+    for bp_idx, quality in breakpoints:
+        if bp_idx < lo_idx or bp_idx > hi_idx:
+            continue
+        # 确保不会让剩余段无词可分配
+        max_idx = total_words - min_words * max(0, remaining_segments - 1)
+        if bp_idx > max_idx:
+            continue
+
+        dist_norm = abs(bp_idx - target_idx) / max_range
+        score = quality * 0.15 + (1.0 - dist_norm) * 0.85
+
+        if score > best_score:
+            best_score = score
+            best_idx = bp_idx
+
+    return best_idx
+
 def split_english_text(en_text: str, num_parts: int, chinese_segments: Optional[list[str]] = None) -> list[str]:
     """
     将英文段落按中文断句比例分割，长的中文配长的英文，短的配短的。
@@ -486,13 +653,18 @@ def _split_proportional(en_text: str, cn_segments: list[str]) -> list[str]:
 
     MIN_WORDS = min(3, max(1, total_words // num_parts))
 
-    # ── 收集子句（以逗号/句末标点结尾的连续词）──
+    # ── 构建质量断点和子句 ──
+    breakpoints = _extract_word_breakpoints(words)
+
+    # 从质量断点推导子句（子句 = 两个相邻高质量断点之间的词区间）
+    # 子句边界：quality >= 2 的断点（句末/分号/冒号/逗号级）
     clauses = []
     cl_start = 0
-    for i, w in enumerate(words):
-        if w.endswith('.') or w.endswith('!') or w.endswith('?') or w.endswith(';') or w.endswith(','):
-            clauses.append((cl_start, i + 1))
-            cl_start = i + 1
+    for bp_idx, bp_quality in breakpoints:
+        if bp_quality >= 2:
+            clauses.append((cl_start, bp_idx))
+            cl_start = bp_idx
+    # 最后一个子句
     if cl_start < len(words):
         if clauses:
             clauses[-1] = (clauses[-1][0], len(words))
@@ -526,9 +698,9 @@ def _split_proportional(en_text: str, cn_segments: list[str]) -> list[str]:
 
     # ── 混合策略：子句足够多时用子句池化，否则用词级切割 ──
     if len(clauses) >= num_parts:
-        result = _clause_pool_assign(words, clauses, targets, num_parts, MIN_WORDS)
+        result = _clause_pool_assign(words, clauses, breakpoints, targets, num_parts, MIN_WORDS)
     else:
-        result = _word_level_cut(words, targets, num_parts, MIN_WORDS)
+        result = _word_level_cut(words, breakpoints, targets, num_parts, MIN_WORDS)
 
     # 后处理
     result = [p for p in result if p.strip()]
@@ -541,49 +713,123 @@ def _split_proportional(en_text: str, cn_segments: list[str]) -> list[str]:
     return result[:num_parts]
 
 
-def _clause_pool_assign(words, clauses, targets, num_parts, MIN_WORDS):
-    """子句池化分配：从子句中取，优先在句末标点断"""
+def _clause_pool_assign(words, clauses, breakpoints, targets, num_parts, MIN_WORDS):
+    """子句池化分配：从子句池中取，对每个段尝试多种方案选最优停点。
+
+    改进点（相比旧版）：
+    - 每个段尝试取 1/2/3/... 个子句，用评分选最优方案
+    - 评分 = 词数接近度(85%) + 断点质量(15%)
+    - 断在高质量标点处（句号>分号/冒号>逗号）有加分
+    - 连词归入下一段（不拖在当前段尾）
+    - 最后两段平衡：如果最后一段词数 > 倒数第二段的 2 倍，做平衡调整
+    """
+    total = len(words)
     parts = []
-    ci = 0
+    ci = 0  # 当前子句索引
+
+    # 构建子句结尾位置的断点质量查找（快速查某个 word_index 处的质量）
+    bp_quality_at = {}
+    for bp_idx, bp_quality in breakpoints:
+        # 取最近的质量级别（最高级别的优先）
+        if bp_idx not in bp_quality_at or bp_quality > bp_quality_at[bp_idx]:
+            bp_quality_at[bp_idx] = bp_quality
+
     for seg_i in range(num_parts - 1):
         target = targets[seg_i]
-        seg_list = []
+
+        if ci >= len(clauses):
+            # 已无子句可用，用最后一段内容填充
+            parts.append(' '.join(words[clauses[-1][0]:clauses[-1][1]] if clauses else []))
+            continue
+
+        # ── 尝试取 k 个子句，选评分最高的方案 ──
+        best_k = 1
+        best_score = -999.0
+        best_acc = 0
+        best_quality = 0
+
         acc = 0
+        for k in range(1, len(clauses) - ci + 1):
+            cl_s, cl_e = clauses[ci + k - 1]
+            acc += cl_e - cl_s
+            clamp_end = words[cl_e - 1]
 
-        while ci < len(clauses) and acc < target:
-            cl_s, cl_e = clauses[ci]
-            cl_len = cl_e - cl_s
-            if acc >= MIN_WORDS and acc + cl_len > target * 1.5:
-                break
-            seg_list.extend(words[cl_s:cl_e])
-            acc += cl_len
-            ci += 1
-            if words[cl_e - 1].endswith(('.', '!', '?', ';')) and acc >= target * 0.6:
+            # 确保至少留一个子句给剩余段落
+            if ci + k >= len(clauses):
                 break
 
-        if acc == 0 and ci < len(clauses):
-            cl_s, cl_e = clauses[ci]
-            seg_list = list(words[cl_s:cl_e])
-            ci += 1
+            # 计算方案评分
+            # 距离分：越接近目标越好
+            dist_score = -abs(acc - target) / max(target, 1)
+            # 质量分：断点质量越高越好
+            end_quality = bp_quality_at.get(cl_e, 0)
+            # 如果以连词结尾，降低质量（连词不应在段尾）
+            next_start = clauses[ci + k][0] if ci + k < len(clauses) else total
+            if next_start < total and words[next_start].lower().rstrip(',.;:!?') in _CONJUNCTIONS:
+                end_quality = max(0, end_quality - 1)
+
+            score = dist_score * 0.85 + end_quality * 0.15
+
+            if score > best_score:
+                best_score = score
+                best_k = k
+                best_acc = acc
+                best_quality = end_quality
+
+            # 如果已经在高质量断点处且接近 target，提前终止搜索
+            if end_quality >= 3 and acc >= target * 0.7:
+                break
+
+        # ── 收集 best_k 个子句 ──
+        seg_list = []
+        for k in range(best_k):
+            if ci < len(clauses):
+                cl_s, cl_e = clauses[ci]
+                seg_list.extend(words[cl_s:cl_e])
+                ci += 1
 
         parts.append(' '.join(seg_list))
 
+    # ── 收集最后一段（剩余子句）──
     last = []
     while ci < len(clauses):
         cl_s, cl_e = clauses[ci]
         last.extend(words[cl_s:cl_e])
         ci += 1
-    parts.append(' '.join(last))
+
+    # 最后两段平衡：如果最后一段远长于倒数第二段，将尾段的前几个词移到前段
+    if len(parts) >= 1 and len(last) > 1:
+        lp = len(parts[-1].split()) if parts[-1] else 0
+        ll = len(last)
+        if lp > 0 and ll > lp * 2:
+            # 将最后一段末尾的平衡点（中间某个合适位置）之前的词移到前段
+            target_lp = (lp + ll) // 2
+            move_count = target_lp - lp
+            if move_count > 0 and move_count < ll:
+                # 在 move_count 附近找断点
+                sub_breakpoints = _extract_word_breakpoints(last)
+                best_bp = _find_best_breakpoint(
+                    sub_breakpoints, max(1, move_count),
+                    max(1, move_count // 2), min(ll - 1, move_count * 2),
+                    ll, 1, 1
+                )
+                if best_bp > 0 and best_bp < ll:
+                    moved_words = last[:best_bp]
+                    last = last[best_bp:]
+                    parts[-1] = (parts[-1] + ' ' + ' '.join(moved_words)).strip()
+
+    parts.append(' '.join(last) if last else (parts[-1] if parts else ''))
     return parts
 
 
-def _word_level_cut(words, targets, num_parts, MIN_WORDS):
-    """词级切割：按目标词数在单词边界切割，优先在标点处断。
 
-    改进点(相比旧版):
-    - 动态调整「向后搜索更好断点」的搜索半径
-    - 当目标很短时（≤5 词），扩大搜索范围并用多阶段回退
-    - 最短段不低于 MIN_WORDS 词
+def _word_level_cut(words, breakpoints, targets, num_parts, MIN_WORDS):
+    """词级切割：在单词边界切割，用评分选最优断点。
+
+    改进点（相比旧版）：
+    - 搜索范围扩大到 ±30% 总词数（而非 ±8 词固定值）
+    - 遍历范围内所有候选断点，计算评分选最优（而非找到第一个就停）
+    - 连词归属优化：断在连词前，让连词归入下一段
     """
     total = len(words)
     parts = []
@@ -592,37 +838,89 @@ def _word_level_cut(words, targets, num_parts, MIN_WORDS):
     for seg_i in range(num_parts - 1):
         target = targets[seg_i]
         target_end = start + target
+        remaining = num_parts - seg_i - 1
 
-        # 动态搜索半径：目标越小，搜索越宽（比例上）
-        search_radius = max(3, min(8, target // 2))
+        # 搜索范围：以 target_end 为中心，半径为目标 50%（至少 5，至多 total*0.3）
+        search_radius = max(5, min(target, total - start) // 2)
+        search_radius = min(search_radius, max(5, int(total * 0.3)))
 
-        # 阶段1：在目标附近找句末标点断点
-        best = target_end
         lo = max(start + MIN_WORDS, target_end - search_radius)
-        hi = min(total, target_end + search_radius)
-        for w in range(hi - 1, lo - 1, -1):
-            if w > start and words[w - 1].endswith(('.', '!', '?', ';')):
-                best = w
-                break
+        hi = min(total - MIN_WORDS * remaining, target_end + search_radius)
 
-        # 阶段2：没句末标点，找逗号
-        if best == target_end:
-            for w in range(hi - 1, lo - 1, -1):
-                if w > start and words[w - 1].endswith(','):
-                    best = w
+        # 连词优化：如果搜索范围内最高质量≤1（只有空格边界或连词），
+        # 而 lo 之外附近有一个连词断点(quality=1)，允许 lo 下探到它
+        in_range_qualities = [q for idx, q in breakpoints if lo <= idx <= hi]
+        max_quality_in_range = max(in_range_qualities) if in_range_qualities else -1
+        if max_quality_in_range <= 1 and lo > start + 1:
+            for bp_idx, bp_q in breakpoints:
+                if bp_q >= 1 and lo > bp_idx >= start + 1:
+                    lo = bp_idx
                     break
 
-        # 阶段3：确保不低于 MIN_WORDS
-        best = max(best, start + MIN_WORDS)
-        best = min(best, total - MIN_WORDS * (num_parts - seg_i - 1))
+        if lo >= hi:
+            lo = max(start + 1, target_end - 1)
+            hi = min(total - 1, target_end + 1)
+
+        # 使用 _find_best_breakpoint 选最优断点
+        best = _find_best_breakpoint(
+            breakpoints, target_end, lo, hi,
+            total, remaining, MIN_WORDS
+        )
+
+        # 连词归属优化：如果范围内有一个连词断点，优先选择它
+        # （让连词归入下一段，当前段结尾干净自然）
+        best_conj_bp = -1
+        best_conj_dist = 999
+        for bp_idx, bp_q in breakpoints:
+            if bp_q == 1 and lo <= bp_idx <= hi:
+                dist = abs(bp_idx - target_end)
+                if dist < best_conj_dist:
+                    best_conj_dist = dist
+                    best_conj_bp = bp_idx
+        if best_conj_bp > start and best_conj_bp < total:
+            best = best_conj_bp
+
+        # 连词归属优化：如果断点后的第一个词是连词，将断点前移（排除连词）
+        # 这样连词归入下一段，当前段结尾干净
+        if best < total and best > start:
+            next_word = words[best].lower().rstrip(',.;:!?')
+            if next_word in _CONJUNCTIONS and best > start + 1:
+                best -= 1
+                # 继续后退直到单词边界 — 但只需退一次（连词通常一个单词）
+                # 如果前一个单词恰好也是连词则继续退
+                while best > start + 1:
+                    prev_word = words[best - 1].lower().rstrip(',.;:!?')
+                    if prev_word not in _CONJUNCTIONS:
+                        break
+                    best -= 1
 
         if best <= start:
-            best = min(start + target, total)
+            best = min(start + max(1, target), total - 1)
 
         parts.append(' '.join(words[start:best]))
         start = best
 
     parts.append(' '.join(words[start:]))
+
+    # 连词优化后处理：如果某段以连词结尾，将连词移到下一段开头
+    for i in range(len(parts) - 1):
+        if not parts[i]:
+            continue
+        pwords = parts[i].split()
+        if pwords and pwords[-1].lower().rstrip(',.;:!?') in _CONJUNCTIONS:
+            trailing_conj = pwords[-1]
+            parts[i] = ' '.join(pwords[:-1])
+            parts[i + 1] = trailing_conj + ' ' + parts[i + 1]
+
+    # 修复空段（连词移动后可能导致第一段为空）
+    for i in range(len(parts)):
+        if not parts[i] and i + 1 < len(parts):
+            # 从下一段借一个词
+            next_words = parts[i + 1].split()
+            if len(next_words) > 1:
+                parts[i] = next_words[0]
+                parts[i + 1] = ' '.join(next_words[1:])
+
     return parts
 
 
@@ -746,11 +1044,12 @@ def _split_long_segment(text: str, max_len: int = 42) -> list[str]:
     """将过长英文片段在自然断点处拆分为多段。
 
     拆分优先级：
-    1. 句末标点 (. ! ? ;) 后的空格
-    2. 逗号 (,) 后的空格
-    3. 连词 (and/but/or/that/which/who/while/when/where) 前的空格
-    4. 最后一个普通空格
-    5. 找不到断点则保留超长段（宁可超长，不丢内容）
+    1. 句末标点 (. ! ?) 后的空格（需确认非缩写）
+    2. 分号 (;) 冒号 (:) 破折号 (—) 后的空格
+    3. 逗号 (,) 后的空格
+    4. 连词前的空格
+    5. 最后一个普通空格
+    6. 找不到断点则保留超长段（宁可超长，不丢内容）
 
     关键约束：
     - 绝不截断单词
@@ -760,34 +1059,56 @@ def _split_long_segment(text: str, max_len: int = 42) -> list[str]:
     parts = []
     remaining = text.strip()
 
+    # 连词集合（比 _CONJUNCTIONS 稍精简，因为 _split_long_segment 是字符级操作）
+    conj_pattern = (
+        r'\s+(and|but|or|so|yet|nor|for'
+        r'|because|although|though|if|when|while'
+        r'|where|which|that|who|whom|whose'
+        r'|after|before|since|until|unless|whereas)\s+'
+    )
+
     while len(remaining) > max_len:
         best = -1
         window = remaining[:max_len + 1]
 
-        # 1) 句末标点后的空格（最佳断点）
-        for m in re.finditer(r'[.!?;]\s+', window):
-            if m.end() <= max_len:
-                best = m.end()
+        # 1) 句末标点后的空格（确认非缩写）
+        for m in re.finditer(r'([.!?])\s+', window):
+            end_pos = m.end()
+            if end_pos <= max_len:
+                # 检查 . 是否为缩写的一部分
+                punct = m.group(1)
+                if punct == '.':
+                    before_punct = remaining[:m.start()]
+                    last_word = before_punct.rsplit(None, 1)[-1] if before_punct else ''
+                    if last_word and _is_abbreviation(last_word + '.'):
+                        continue  # 跳过缩写
+                best = end_pos
 
-        # 2) 逗号后的空格
+        # 2) 分号/冒号/破折号后的空格
+        if best <= 0:
+            for m in re.finditer(r'[;:—]\s+', window):
+                if m.end() <= max_len:
+                    best = m.end()
+
+        # 3) 逗号后的空格
         if best <= 0:
             for m in re.finditer(r',\s+', window):
                 if m.end() <= max_len:
                     best = m.end()
 
-        # 3) 连词前的空格
+        # 4) 连词前的空格（扩展了连词列表）
         if best <= 0:
-            for m in re.finditer(r'\s+(and|but|or|that|which|who|while|when|where)\s+', window):
+            for m in re.finditer(conj_pattern, window):
                 if m.start() <= max_len:
                     best = m.start()
 
-        # 4) 最后一个普通空格（保证不截断单词）
+        # 5) 最后一个普通空格（保证不截断单词）
         if best <= 0:
             last_space = window.rfind(' ')
             if last_space > 0:
                 best = last_space + 1
 
-        # 5) 找不到合适断点，保留超长段（不强行截断单词）
+        # 6) 找不到合适断点，保留超长段（不强行截断单词）
         if best <= 0:
             break
 
