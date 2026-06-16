@@ -103,6 +103,23 @@ def on_load_sample():
     st.session_state.srt_text = SAMPLE_SRT
 
 
+def on_fill_proofread():
+    """一键填入校对文档回调，并设置标记以弹出提示"""
+    st.session_state.proofread_text = st.session_state.get("formatted_proofread", "")
+    st.session_state._auto_filled_from_tab1 = True
+
+
+def on_raw_text_upload():
+    """原始文本上传回调：读取 .txt 或 .docx 文件内容写入 session_state"""
+    file = st.session_state.get("raw_text_file")
+    if file is None:
+        return
+    if file.name.endswith(".docx"):
+        st.session_state.raw_format_text = parse_docx(file.read())
+    else:
+        st.session_state.raw_format_text = file.read().decode("utf-8")
+
+
 # ── 页面配置 ──────────────────────────────────────────────
 
 st.set_page_config(
@@ -314,7 +331,85 @@ with st.sidebar:
 
 # ── 主内容区 ──────────────────────────────────────────────
 
-col1, col2 = st.columns(2)
+tab_tt1, tab_tt2 = st.tabs(["📝 文本排版", "🎬 字幕排版"])
+
+# ════════════════════════════════════════════════════════════
+# Tab 1: AI 文本排版（预处理步骤）
+# ════════════════════════════════════════════════════════════
+
+with tab_tt1:
+    st.subheader("📝 AI 文本排版")
+    st.caption("粘贴原始混排中英文本，AI 自动排版为「一句中文一句英文」的校对文档格式，供下一步字幕匹配使用。")
+
+    raw_text = st.text_area(
+        "粘贴原始混排文本",
+        height=300,
+        placeholder="支持任意中英混排格式，例如：\n\n今天年初二，全国人民都在回娘家吧？\nToday is the second day of the new year. People all over the country are returning to their parents' homes, right?\n\n我们莆田人，今天可不许走亲戚串门。\nWe, the people of Putian, are not allowed to visit relatives or friends today.",
+        label_visibility="collapsed",
+        key="raw_format_text",
+    )
+
+    raw_text_file = st.file_uploader(
+        "或上传原始文本 (.txt / .docx)",
+        type=["txt", "docx"],
+        key="raw_text_file",
+        on_change=on_raw_text_upload,
+    )
+    if raw_text_file:
+        st.success(f"已加载：{raw_text_file.name}（{len(raw_text)} 字符）")
+
+    # 排版按钮
+    format_disabled = not (raw_text.strip() and has_llm)
+    format_clicked = st.button(
+        "🚀 开始排版",
+        type="primary",
+        use_container_width=True,
+        disabled=format_disabled,
+        key="btn_format_text",
+    )
+
+    if not has_llm:
+        st.info("💡 需要在左侧边栏配置 DeepSeek API Key 才能使用 AI 排版功能")
+
+    if format_clicked and raw_text.strip():
+        with st.spinner("🤖 AI 排版中，请稍候..."):
+            try:
+                llm_fmt = create_llm_service(llm_provider, llm_api_key, llm_model)
+                formatted = llm_fmt.format_text_for_proofreading(raw_text)
+                st.session_state["formatted_proofread"] = formatted
+                st.success("✅ 排版完成！校对文档已生成，请查看下方结果。")
+            except Exception as e:
+                st.error(f"排版失败：{e}")
+
+    # 显示排版结果
+    formatted_proofread = st.session_state.get("formatted_proofread", "")
+    if formatted_proofread:
+        st.divider()
+        st.subheader("📄 排版结果")
+        st.caption(f"共 {len(formatted_proofread)} 字符")
+        st.code(formatted_proofread, language="text")
+
+        # 一键填入按钮
+        st.button(
+            "📋 一键填入校对文档",
+            type="primary",
+            use_container_width=True,
+            key="btn_fill_proofread",
+            on_click=on_fill_proofread,
+        )
+
+        # 检查是否刚刚点击了填入
+
+# ════════════════════════════════════════════════════════════
+# Tab 2: 双语字幕匹配（现有功能）
+# ════════════════════════════════════════════════════════════
+
+with tab_tt2:
+    # 检查是否自动填入（从 tab1 一键填入后显示提示）
+    if st.session_state.pop("_auto_filled_from_tab1", False):
+        st.toast("✅ 校对文档已自动填入！请上传 SRT 文件后点击「开始排版」", icon="✅")
+
+    col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("📄 文档一：校对文档")

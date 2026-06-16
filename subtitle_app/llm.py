@@ -175,6 +175,63 @@ Output JSON only, no other text."""
         except Exception as e:
             raise RuntimeError(f"LLM 字幕匹配失败: {e}")
 
+    # ── 文本排版格式化 ────────────────────────────────────
+
+    def format_text_for_proofreading(self, raw_text: str) -> str:
+        """
+        将原始混排中英文本，通过 LLM 排版为一句中文一句英文的校对文档格式。
+
+        LLM 会：
+        - 保持中文原文一字不改
+        - 将中英文断句整理成完整句子（每段约 2-3 个断句）
+        - 校对英文的语法和拼写错误
+        - 英文用词尽量简短
+        - 输出格式：中文一行 → 英文一行 → 空行 → 中文一行 → 英文一行...
+        """
+        prompt = f"""你是专业的中英文双语排版专家。请按照以下规则整理文本：
+
+## 核心规则（按优先级排序）：
+
+1. **中文原封不动** — 中文内容一字不改，不要增加、删除或修改任何中文文字
+2. **一句中文一句英文** — 输出格式必须是：一行中文 → 下一行英文 → 空行 → 一行中文 → 下一行英文 ...
+3. **完整句子** — 中英文断句整理成一句完整的句子，不要破碎的片段
+4. **每段 2-3 个断句** — 每一段（一个中英对译组）里大概包含 2-3 个断句，内容不要太长
+5. **英文校对** — 校对英文内容，修正语法错误和拼写错误
+6. **英文简短** — 英文部分用词尽量简短，使用通俗易懂的词汇
+
+## 输出格式示例：
+
+中文第一句
+English first sentence.
+
+中文第二句
+English second sentence.
+
+中文第三句
+English third sentence.
+
+## 原始文本：
+
+{raw_text}
+
+请直接输出排版后的文本，不要加任何解释说明。"""
+
+        try:
+            result_text = self._call_api(prompt, max_tokens=4096)
+            # 去除可能的开头/结尾 markdown 代码块标记
+            result_text = result_text.strip()
+            if result_text.startswith("```"):
+                # 去掉 ```...``` 包裹
+                lines = result_text.split("\n")
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                result_text = "\n".join(lines).strip()
+            return result_text
+        except Exception as e:
+            raise RuntimeError(f"LLM 文本排版失败: {e}")
+
     # ── 辅助方法 ──────────────────────────────────────────
 
     @staticmethod
