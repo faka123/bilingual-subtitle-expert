@@ -1,5 +1,7 @@
 """... (同上) """
 
+import re
+import os
 import streamlit as st
 from core import (
     process_subtitles,
@@ -77,6 +79,8 @@ def on_proofread_upload():
     file = st.session_state.get("proofread_file")
     if file is None:
         return
+    # 记录上传文件名（去除扩展名），用于生成下载文件名
+    st.session_state.proofread_filename = file.name
     if file.name.endswith(".docx"):
         st.session_state.proofread_text = parse_docx(file.read())
     else:
@@ -88,6 +92,8 @@ def on_srt_upload():
     file = st.session_state.get("srt_file")
     if file is None:
         return
+    # 记录上传文件名（去除扩展名），用于生成下载文件名
+    st.session_state.srt_filename = file.name
     st.session_state.srt_text = file.read().decode("utf-8")
 
 
@@ -538,12 +544,26 @@ if st.session_state.get("processed"):
     st.divider()
     st.subheader("💾 下载结果")
 
+    # 生成下载文件名：基于上传的 SRT 文件名（去除扩展名），去掉所有数字
+    import os
+    srt_name = st.session_state.get("srt_filename", "")
+    if srt_name:
+        base = os.path.splitext(srt_name)[0]
+    else:
+        base = "bilingual_subtitles"
+    # 去掉文件名中的所有数字，去除首尾下划线和空格
+    clean_name = re.sub(r'\d+', '', base).strip(' _-')
+    if not clean_name:
+        clean_name = "bilingual_subtitles"
+    bilingual_filename = f"{clean_name}_bilingual.srt"
+    english_filename = f"{clean_name}_english.srt"
+
     dl_col1, dl_col2 = st.columns(2)
     with dl_col1:
         st.download_button(
             label="📥 下载双语 SRT 文件",
             data=output_srt,
-            file_name="bilingual_subtitles.srt",
+            file_name=bilingual_filename,
             mime="text/plain",
             use_container_width=True,
         )
@@ -557,7 +577,7 @@ if st.session_state.get("processed"):
             st.download_button(
                 label="📥 仅下载英文 SRT",
                 data=en_only,
-                file_name="english_only.srt",
+                file_name=english_filename,
                 mime="text/plain",
                 use_container_width=True,
             )
