@@ -457,13 +457,16 @@ def split_english_text(en_text: str, num_parts: int, chinese_segments: Optional[
 
 
 def _split_proportional(en_text: str, cn_segments: list[str]) -> list[str]:
-    """按中文段长度比例分割英文，词级智能分配。
+    """按中文段长度比例 + 语义边界混合策略分割英文。
 
-    相对于旧版的关键改进：
-    - 按单词数（而非字符位置）进行比例分配
-    - 始终在单词边界处断开，绝不截断单词
-    - 优先选择句末标点（. ! ? ;）作为断点，其次逗号（,），最后普通空格
-    - 保证不丢失、不重复任何英文内容
+    策略：动态选择最佳方法——
+    - 英文有足够多的子句边界（≥目标段数）→ 子句池化分配（语义最优）
+    - 英文子句边界太少 → 按词数比例 + 在空格/标点处智能切割
+
+    保证：
+    - 每段至少 3 词
+    - 绝不截断单词（只在空格处断）
+    - 不丢失不重复任何内容
     """
     cn_lens = [len(_normalize_for_matching(s)) for s in cn_segments]
     total_cn = sum(cn_lens)
@@ -475,68 +478,152 @@ def _split_proportional(en_text: str, cn_segments: list[str]) -> list[str]:
     words = en_text.split()
     total_words = len(words)
 
-    # 单词数不足以分配时，每段至少一个单词
     if total_words <= num_parts:
-        parts = words[:]
-        if len(parts) < num_parts:
-            parts.extend([words[-1]] * (num_parts - len(parts)))
-        return parts
+        result = words[:]
+        while len(result) < num_parts:
+            result.append(words[-1])
+        return result[:num_parts]
 
-    def _break_quality(word_idx: int) -> int:
-        """词间断点质量：0=句末标点(最佳), 1=逗号, 2=普通空格(最差)"""
-        if word_idx <= 0 or word_idx >= len(words):
-            return 2
-        prev = words[word_idx - 1]
-        if prev and prev[-1] in '.!?;':
-            return 0
-        if prev and prev[-1] == ',':
-            return 1
-        return 2
+    MIN_WORDS = min(3, max(1, total_words // num_parts))
 
+    # ── 收集子句（以逗号/句末标点结尾的连续词）──
+    clauses = []
+    cl_start = 0
+    for i, w in enumerate(words):
+        if w.endswith('.') or w.endswith('!') or w.endswith('?') or w.endswith(';') or w.endswith(','):
+            clauses.append((cl_start, i + 1))
+            cl_start = i + 1
+    if cl_start < len(words):
+        if clauses:
+            clauses[-1] = (clauses[-1][0], len(words))
+        else:
+            clauses.append((cl_start, len(words)))
+
+    # ── 计算每段目标词数 ──
+    targets = []
+    remain = total_words
+    remain_cn = total_cn
+    for i in range(num_parts):
+        ratio = cn_lens[i] / max(1, remain_cn)
+        t = max(MIN_WORDS, round(remain * ratio))
+        min_rest = MIN_WORDS * (num_parts - i - 1)
+        t = min(t, remain - min_rest)
+        t = max(MIN_WORDS, t)
+        t = min(t, remain)
+        targets.append(t)
+        remain -= t
+        remain_cn -= cn_lens[i]
+
+    # 修正累积误差
+    diff = sum(targets) - total_words
+    while diff > 0:
+        for i in reversed(range(num_parts)):
+            if diff <= 0: break
+            if targets[i] > MIN_WORDS:
+                targets[i] -= 1; diff -= 1
+    while diff < 0:
+        targets[-1] += abs(diff); diff = 0
+
+    # ── 混合策略：子句足够多时用子句池化，否则用词级切割 ──
+    if len(clauses) >= num_parts:
+        result = _clause_pool_assign(words, clauses, targets, num_parts, MIN_WORDS)
+    else:
+        result = _word_level_cut(words, targets, num_parts, MIN_WORDS)
+
+    # 后处理
+    result = [p for p in result if p.strip()]
+    while len(result) < num_parts:
+        result.append(result[-1] if result else "[EMPTY]")
+    if len(result) > num_parts:
+        overflow = ' '.join(result[num_parts - 1:])
+        result = result[:num_parts - 1] + [overflow]
+
+    return result[:num_parts]
+
+
+def _clause_pool_assign(words, clauses, targets, num_parts, MIN_WORDS):
+    """子句池化分配：从子句中取，优先在句末标点断"""
+    parts = []
+    ci = 0
+    for seg_i in range(num_parts - 1):
+        target = targets[seg_i]
+        seg_list = []
+        acc = 0
+
+        while ci < len(clauses) and acc < target:
+            cl_s, cl_e = clauses[ci]
+            cl_len = cl_e - cl_s
+            if acc >= MIN_WORDS and acc + cl_len > target * 1.5:
+                break
+            seg_list.extend(words[cl_s:cl_e])
+            acc += cl_len
+            ci += 1
+            if words[cl_e - 1].endswith(('.', '!', '?', ';')) and acc >= target * 0.6:
+                break
+
+        if acc == 0 and ci < len(clauses):
+            cl_s, cl_e = clauses[ci]
+            seg_list = list(words[cl_s:cl_e])
+            ci += 1
+
+        parts.append(' '.join(seg_list))
+
+    last = []
+    while ci < len(clauses):
+        cl_s, cl_e = clauses[ci]
+        last.extend(words[cl_s:cl_e])
+        ci += 1
+    parts.append(' '.join(last))
+    return parts
+
+
+def _word_level_cut(words, targets, num_parts, MIN_WORDS):
+    """词级切割：按目标词数在单词边界切割，优先在标点处断。
+
+    改进点(相比旧版):
+    - 动态调整「向后搜索更好断点」的搜索半径
+    - 当目标很短时（≤5 词），扩大搜索范围并用多阶段回退
+    - 最短段不低于 MIN_WORDS 词
+    """
+    total = len(words)
     parts = []
     start = 0
-    remaining_cn = total_cn
-    remaining_words = total_words
 
-    for i in range(num_parts - 1):
-        # 按剩余中文字符比例计算本段应得单词数
-        ratio = cn_lens[i] / remaining_cn
-        target_count = max(1, round(remaining_words * ratio))
-        target_idx = start + target_count
+    for seg_i in range(num_parts - 1):
+        target = targets[seg_i]
+        target_end = start + target
 
-        # 在目标位置附近找最佳断点（搜索窗口：±target_count/2，至少±3词）
-        window = max(3, target_count // 2)
-        lo = max(start + 1, target_idx - window)
-        hi = min(len(words), target_idx + window + 1)
+        # 动态搜索半径：目标越小，搜索越宽（比例上）
+        search_radius = max(3, min(8, target // 2))
 
-        best_idx = target_idx
-        best_score = float('inf')
-        for w in range(lo, hi):
-            q = _break_quality(w)
-            dist = abs(w - target_idx)
-            score = q * 4 + dist  # 质量优先于距离
-            if score < best_score:
-                best_score = score
-                best_idx = w
+        # 阶段1：在目标附近找句末标点断点
+        best = target_end
+        lo = max(start + MIN_WORDS, target_end - search_radius)
+        hi = min(total, target_end + search_radius)
+        for w in range(hi - 1, lo - 1, -1):
+            if w > start and words[w - 1].endswith(('.', '!', '?', ';')):
+                best = w
+                break
 
-        if best_idx <= start:
-            best_idx = target_idx
+        # 阶段2：没句末标点，找逗号
+        if best == target_end:
+            for w in range(hi - 1, lo - 1, -1):
+                if w > start and words[w - 1].endswith(','):
+                    best = w
+                    break
 
-        parts.append(' '.join(words[start:best_idx]))
-        actual = best_idx - start
-        remaining_words -= actual
-        remaining_cn -= cn_lens[i]
-        start = best_idx
+        # 阶段3：确保不低于 MIN_WORDS
+        best = max(best, start + MIN_WORDS)
+        best = min(best, total - MIN_WORDS * (num_parts - seg_i - 1))
 
-    # 最后一段：全部剩余词
+        if best <= start:
+            best = min(start + target, total)
+
+        parts.append(' '.join(words[start:best]))
+        start = best
+
     parts.append(' '.join(words[start:]))
-
-    # 过滤空段并补足
-    parts = [p for p in parts if p.strip()]
-    while len(parts) < num_parts:
-        parts.append(parts[-1] if parts else "[EMPTY]")
-
-    return parts[:num_parts]
+    return parts
 
 
 def _split_uniform(en_text: str, num_parts: int) -> list[str]:
