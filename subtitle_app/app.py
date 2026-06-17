@@ -76,55 +76,38 @@ SAMPLE_SRT = """1
 
 def format_text_by_rules(raw_text: str) -> str:
     """
-    不需要 AI，纯粹用规则将「多行中文 + 多行英文」排版为交替格式。
+    不需要 AI，用规则将原始文本排版为「一句中文一句英文」的校对文档格式。
 
-    支持的两种输入格式：
-    1. 前半中文、后半英文（如：中文段落 × N，然后英文段落 × N）
-    2. 中英交替混排（按中文检测比例分组）
+    核心逻辑（与 DeepSeek 网页版一致）：
+    1. 按行检测每行是中文还是英文
+    2. 中文行归一组（保持原顺序），英文行归一组（保持原顺序）
+    3. 按顺序一对一配对：中1→英1, 中2→英2, ...
+    4. 输出：中文一行 → 英文一行 → 空行 → 中文一行 → ...
+
+    支持任意输入格式：全部中文在前英文在后、交替混排、带空行分隔均可。
     """
     from core import _chinese_char_ratio
 
     lines = raw_text.strip().split("\n")
-    # 过滤空行
     non_empty = [l.strip() for l in lines if l.strip()]
     if not non_empty:
         return ""
 
-    # 检测每行是否含中文
-    is_cn = [_chinese_char_ratio(l) > 0.3 for l in non_empty]
-    cn_lines = [non_empty[i] for i, v in enumerate(is_cn) if v]
-    en_lines = [non_empty[i] for i, v in enumerate(is_cn) if not v]
+    # 按中英文分组（保持原始顺序）
+    cn_lines = [l for l in non_empty if _chinese_char_ratio(l) > 0.3]
+    en_lines = [l for l in non_empty if _chinese_char_ratio(l) <= 0.3]
 
-    # 策略：如果中文和英文行数相近（差距 ≤ 30%），视为交替格式 → 按原始顺序输出
-    # 如果差异大（如所有中文在前、英文在后），则按交替配对
-    total = len(non_empty)
-    cn_count = len(cn_lines)
-    en_count = len(en_lines)
-    max_count = max(cn_count, en_count)
-
-    # 判断是否为「中文全在前 / 英文全在后」格式
-    # 如果前半部分中文占比高、后半部分英文占比高，则视为分块格式
-    first_half = non_empty[:total // 2]
-    second_half = non_empty[total // 2:]
-    first_cn = sum(1 for l in first_half if _chinese_char_ratio(l) > 0.3)
-    second_cn = sum(1 for l in second_half if _chinese_char_ratio(l) > 0.3)
-    first_ratio = first_cn / max(len(first_half), 1)
-    second_ratio = second_cn / max(len(second_half), 1)
-
-    if first_ratio > 0.6 and second_ratio < 0.3:
-        # 中文在前、英文在后 → 交替配对
-        result = []
-        for i in range(max_count):
-            if i < cn_count:
-                result.append(cn_lines[i])
-            if i < en_count:
-                result.append(en_lines[i])
-            if i < max_count - 1:
-                result.append("")  # 空行分隔
-        return "\n".join(result)
-    else:
-        # 已经是交替格式 → 每个非空行保持原样，之间加空行
-        return "\n\n".join(non_empty)
+    # 按顺序一对一配对
+    max_count = max(len(cn_lines), len(en_lines))
+    result = []
+    for i in range(max_count):
+        if i < len(cn_lines):
+            result.append(cn_lines[i])
+        if i < len(en_lines):
+            result.append(en_lines[i])
+        if i < max_count - 1:
+            result.append("")
+    return "\n".join(result)
 
 # ── 回调函数（在 widget 实例化之前执行，可以安全操作 session_state）──
 
@@ -398,7 +381,7 @@ with tab_tt1:
     raw_text = st.text_area(
         "粘贴原始混排文本",
         height=300,
-        placeholder="支持以下两种输入格式：\n\n格式一（中文在前、英文在后）：\n2,300万台湾同胞里\n就接近1,900万人的祖籍\n是福建\nOf the 23 million Taiwanese compatriots,\nnearly 19 million people have their ancestral\nroots in Fujian.\n\n格式二（交替混排，多行中文然后多行英文）：\n今天年初二，全国人民都在回娘家吧？\n我们莆田人，今天可不许走亲戚串门。\nToday is the second day of the new year.\nWe people of Putian are not allowed to visit relatives today.",
+        placeholder="支持任意顺序输入，自动按中/英文分组后交替配对：\n\n孙正义又卖阿里了，2000年的时候投资2,000万美金，那你知道他为什么要卖吗？\n不是因为阿里不好，是因为他其他投资亏太多了。\n软银当年摊子铺的很大，投了几百家公司...\nSon Zhengyi sold Alibaba again. In 2000, he invested 20 million US dollars.\nIt's not because Alibaba is bad. It's because he lost too much in other investments.\nSoftBank had a very large scale back then...",
         label_visibility="collapsed",
         key="raw_format_text",
     )
