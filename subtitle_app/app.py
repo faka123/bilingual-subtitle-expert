@@ -76,13 +76,18 @@ SAMPLE_SRT = """1
 
 def format_text_by_rules(raw_text: str) -> str:
     """
-    将原始字幕文本排版为「一句中文一句英文」的校对文档格式。
+    规则模式排版（无需 AI）：将中文字幕片段与英文翻译片段按段落配对。
 
-    核心逻辑（与 DeepSeek 网页版一致）：
-    1. 将全部行分为中文组和英文组（保持原始顺序）
-    2. 英文行按句末标点（. ? !）合并为完整句子，再按 2-3 句编组
-    3. 中文按字符数比例分配到各英文组
-    4. 交替输出：中文组 → 英文组 → 空行 → ...
+    支持输入格式：
+    - 前半全部中文行 + 后半全部英文行（短视频字幕稿）
+    - 交替混排
+
+    核心逻辑：
+    1. 扫描全部行，按中/英文识别分组（保持原始顺序）
+    2. 英文：按句末标点合并为完整句子，再按 2-3 句编成段落
+    3. 中文：保持原行完整性，按英文段落数量比例分配到各段
+       （用行数比例分配，不切碎中文字符，避免重字）
+    4. 交替输出：中文段 → 英文段 → 空行 → ...
     """
     from core import _chinese_char_ratio
 
@@ -93,10 +98,23 @@ def format_text_by_rules(raw_text: str) -> str:
     cn_lines = [l for l in lines if _chinese_char_ratio(l) > 0.3]
     en_lines = [l for l in lines if _chinese_char_ratio(l) <= 0.3]
 
-    if not cn_lines or not en_lines:
-        return "\n\n".join(lines)
+    # ── 仅有中文 ──
+    if not en_lines:
+        result = []
+        for i in range(0, len(cn_lines), 3):
+            group = cn_lines[i:i + 3]
+            result.append("".join(group))
+            if i + 3 < len(cn_lines):
+                result.append("")
+        return "\n".join(result)
 
-    # ── 英文：按句末标点合并连续行 → 完整句子 ──
+    # ── 仅有英文 ──
+    if not cn_lines:
+        return "\n\n".join(en_lines)
+
+    # ── 中英文均有 ──
+
+    # 第一步：英文按句末标点合并 → 完整句子
     en_sentences = []
     current = ""
     for line in en_lines:
@@ -107,33 +125,28 @@ def format_text_by_rules(raw_text: str) -> str:
     if current:
         en_sentences.append(current)
 
-    # ── 英文句子按 2-3 句编组 → 英文段落 ──
+    # 第二步：英文句子按 2-3 句编组 → 段落（和 DeepSeek 逻辑一致）
+    GROUP = 3
     en_paragraphs = []
-    GROUP_SIZE = 3
-    for i in range(0, len(en_sentences), GROUP_SIZE):
-        group = en_sentences[i:i + GROUP_SIZE]
+    for i in range(0, len(en_sentences), GROUP):
+        group = en_sentences[i:i + GROUP]
         en_paragraphs.append(" ".join(group))
 
-    # ── 中文：按英文段落数量等比例拆分 ──
-    cn_full = "".join(cn_lines)
-    total_cn = len(cn_full)
-    en_para_chars = [len(p) for p in en_paragraphs]
-    total_en = sum(en_para_chars)
-
+    # 第三步：中文行按段落数比例分配（保持行完整，不切碎字符）
+    n_paras = len(en_paragraphs)
+    total_cn = len(cn_lines)
     cn_paragraphs = []
-    pos = 0
-    for ec in en_para_chars:
-        cn_len = max(1, round(ec / total_en * total_cn))
-        remaining = total_cn - pos
-        if cn_len > remaining:
-            cn_len = remaining
-        cn_paragraphs.append(cn_full[pos:pos + cn_len])
-        pos += cn_len
-    # 剩余中文归入最后一段
-    if pos < total_cn and cn_paragraphs:
-        cn_paragraphs[-1] += cn_full[pos:]
+    start = 0
+    for i in range(n_paras):
+        # 该段应分的行数 = 总中文行数 / 段落数（余数分配到前面几段）
+        size = total_cn // n_paras + (1 if i < total_cn % n_paras else 0)
+        end = min(start + size, total_cn)
+        if i == n_paras - 1:
+            end = total_cn  # 最后一段拿完剩余
+        cn_paragraphs.append("".join(cn_lines[start:end]))
+        start = end
 
-    # ── 交替输出 ──
+    # 第四步：交替输出
     result = []
     for i in range(max(len(cn_paragraphs), len(en_paragraphs))):
         if i < len(cn_paragraphs):
