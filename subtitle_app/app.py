@@ -450,6 +450,22 @@ with tab_tt1:
                 else:
                     formatted = format_text_by_rules(raw_text)
                 st.session_state["formatted_proofread"] = formatted
+
+                # ── 规则模式：中英文行数不匹配时提示 ──
+                if not use_ai_mode:
+                    from core import _chinese_char_ratio
+                    all_lines = [l.strip() for l in raw_text.strip().split("\n") if l.strip()]
+                    cn_count = sum(1 for l in all_lines if _chinese_char_ratio(l) > 0.3)
+                    en_count = len(all_lines) - cn_count
+                    if cn_count > 0 and en_count > 0:
+                        diff = abs(cn_count - en_count)
+                        if diff > 3 and diff > max(cn_count, en_count) * 0.2:
+                            st.warning(
+                                f"⚠️ 检测到中文 **{cn_count}** 行，英文 **{en_count}** 行，数量不匹配（差距 {diff} 行）。\n\n"
+                                f"规则模式按「一行对一行」配对，多余的中文行将无法对应英文。"
+                                f"建议切换至「🤖 AI 排版」模式获得更好的排版效果，或手动调整中英文行数使其一致。"
+                            )
+
                 st.success(f"✅ 排版完成！共 {len(formatted)} 字符，请查看下方结果。")
             except Exception as e:
                 st.error(f"排版失败：{e}")
