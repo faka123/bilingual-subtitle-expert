@@ -72,6 +72,60 @@ SAMPLE_SRT = """1
 无数沈阳人用智慧和汗水书写着创业传奇"""
 
 
+# ── 规则排版函数 ──────────────────────────────────────────
+
+def format_text_by_rules(raw_text: str) -> str:
+    """
+    不需要 AI，纯粹用规则将「多行中文 + 多行英文」排版为交替格式。
+
+    支持的两种输入格式：
+    1. 前半中文、后半英文（如：中文段落 × N，然后英文段落 × N）
+    2. 中英交替混排（按中文检测比例分组）
+    """
+    from core import _chinese_char_ratio
+
+    lines = raw_text.strip().split("\n")
+    # 过滤空行
+    non_empty = [l.strip() for l in lines if l.strip()]
+    if not non_empty:
+        return ""
+
+    # 检测每行是否含中文
+    is_cn = [_chinese_char_ratio(l) > 0.3 for l in non_empty]
+    cn_lines = [non_empty[i] for i, v in enumerate(is_cn) if v]
+    en_lines = [non_empty[i] for i, v in enumerate(is_cn) if not v]
+
+    # 策略：如果中文和英文行数相近（差距 ≤ 30%），视为交替格式 → 按原始顺序输出
+    # 如果差异大（如所有中文在前、英文在后），则按交替配对
+    total = len(non_empty)
+    cn_count = len(cn_lines)
+    en_count = len(en_lines)
+    max_count = max(cn_count, en_count)
+
+    # 判断是否为「中文全在前 / 英文全在后」格式
+    # 如果前半部分中文占比高、后半部分英文占比高，则视为分块格式
+    first_half = non_empty[:total // 2]
+    second_half = non_empty[total // 2:]
+    first_cn = sum(1 for l in first_half if _chinese_char_ratio(l) > 0.3)
+    second_cn = sum(1 for l in second_half if _chinese_char_ratio(l) > 0.3)
+    first_ratio = first_cn / max(len(first_half), 1)
+    second_ratio = second_cn / max(len(second_half), 1)
+
+    if first_ratio > 0.6 and second_ratio < 0.3:
+        # 中文在前、英文在后 → 交替配对
+        result = []
+        for i in range(max_count):
+            if i < cn_count:
+                result.append(cn_lines[i])
+            if i < en_count:
+                result.append(en_lines[i])
+            if i < max_count - 1:
+                result.append("")  # 空行分隔
+        return "\n".join(result)
+    else:
+        # 已经是交替格式 → 每个非空行保持原样，之间加空行
+        return "\n\n".join(non_empty)
+
 # ── 回调函数（在 widget 实例化之前执行，可以安全操作 session_state）──
 
 def on_proofread_upload():
@@ -338,13 +392,13 @@ tab_tt1, tab_tt2 = st.tabs(["📝 文本排版", "🎬 字幕排版"])
 # ════════════════════════════════════════════════════════════
 
 with tab_tt1:
-    st.subheader("📝 AI 文本排版")
-    st.caption("粘贴原始混排中英文本，AI 自动排版为「一句中文一句英文」的校对文档格式，供下一步字幕匹配使用。")
+    st.subheader("📝 文本排版")
+    st.caption("粘贴原始混排中英文本，自动排版为「一句中文一句英文」的校对文档格式，供下一步字幕匹配使用。")
 
     raw_text = st.text_area(
         "粘贴原始混排文本",
         height=300,
-        placeholder="支持任意中英混排格式，例如：\n\n今天年初二，全国人民都在回娘家吧？\nToday is the second day of the new year. People all over the country are returning to their parents' homes, right?\n\n我们莆田人，今天可不许走亲戚串门。\nWe, the people of Putian, are not allowed to visit relatives or friends today.",
+        placeholder="支持以下两种输入格式：\n\n格式一（中文在前、英文在后）：\n2,300万台湾同胞里\n就接近1,900万人的祖籍\n是福建\nOf the 23 million Taiwanese compatriots,\nnearly 19 million people have their ancestral\nroots in Fujian.\n\n格式二（交替混排，多行中文然后多行英文）：\n今天年初二，全国人民都在回娘家吧？\n我们莆田人，今天可不许走亲戚串门。\nToday is the second day of the new year.\nWe people of Putian are not allowed to visit relatives today.",
         label_visibility="collapsed",
         key="raw_format_text",
     )
@@ -358,8 +412,23 @@ with tab_tt1:
     if raw_text_file:
         st.success(f"已加载：{raw_text_file.name}（{len(raw_text)} 字符）")
 
-    # 排版按钮
-    format_disabled = not (raw_text.strip() and has_llm)
+    # 排版模式选择
+    format_mode = st.radio(
+        "排版方式",
+        options=["📐 规则排版", "🤖 AI 排版"],
+        index=0,
+        horizontal=True,
+        help="规则排版：自动检测中文/英文段落，智能交替配对（免费、无需 API Key）。AI 排版：用 DeepSeek 大模型排版，效果更好但需配置 API Key。",
+    )
+
+    use_ai_mode = format_mode == "🤖 AI 排版"
+
+    if use_ai_mode and not has_llm:
+        st.info("💡 需要在左侧边栏配置 DeepSeek API Key 才能使用 AI 排版功能")
+        st.caption("可切换至「规则排版」模式，无需 API Key 即可使用。")
+
+    # 排版按钮 — 规则模式始终可用，AI 模式需要 LLM
+    format_disabled = not raw_text.strip() or (use_ai_mode and not has_llm)
     format_clicked = st.button(
         "🚀 开始排版",
         type="primary",
@@ -368,16 +437,16 @@ with tab_tt1:
         key="btn_format_text",
     )
 
-    if not has_llm:
-        st.info("💡 需要在左侧边栏配置 DeepSeek API Key 才能使用 AI 排版功能")
-
     if format_clicked and raw_text.strip():
-        with st.spinner("🤖 AI 排版中，请稍候..."):
+        with st.spinner("🤖 AI 排版中，请稍候..." if use_ai_mode else "📐 规则排版中，请稍候..."):
             try:
-                llm_fmt = create_llm_service(llm_provider, llm_api_key, llm_model)
-                formatted = llm_fmt.format_text_for_proofreading(raw_text)
+                if use_ai_mode:
+                    llm_fmt = create_llm_service(llm_provider, llm_api_key, llm_model)
+                    formatted = llm_fmt.format_text_for_proofreading(raw_text)
+                else:
+                    formatted = format_text_by_rules(raw_text)
                 st.session_state["formatted_proofread"] = formatted
-                st.success("✅ 排版完成！校对文档已生成，请查看下方结果。")
+                st.success(f"✅ 排版完成！共 {len(formatted)} 字符，请查看下方结果。")
             except Exception as e:
                 st.error(f"排版失败：{e}")
 
@@ -386,19 +455,28 @@ with tab_tt1:
     if formatted_proofread:
         st.divider()
         st.subheader("📄 排版结果")
-        st.caption(f"共 {len(formatted_proofread)} 字符")
+        st.caption(f"共 {len(formatted_proofread)} 字符，{len(formatted_proofread.split(chr(10)))} 行")
         st.code(formatted_proofread, language="text")
 
-        # 一键填入按钮
-        st.button(
-            "📋 一键填入校对文档",
-            type="primary",
-            use_container_width=True,
-            key="btn_fill_proofread",
-            on_click=on_fill_proofread,
-        )
-
-        # 检查是否刚刚点击了填入
+        rcol1, rcol2, rcol3 = st.columns([1, 1, 2])
+        with rcol1:
+            st.button(
+                "📋 一键填入校对文档",
+                type="primary",
+                use_container_width=True,
+                key="btn_fill_proofread",
+                on_click=on_fill_proofread,
+            )
+        with rcol2:
+            st.download_button(
+                label="💾 下载排版结果",
+                data=formatted_proofread,
+                file_name="formatted_proofread.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+        with rcol3:
+            st.caption("⬅ 填入校对文档后，切换到「字幕排版」标签页继续处理")
 
 # ════════════════════════════════════════════════════════════
 # Tab 2: 双语字幕匹配（现有功能）
