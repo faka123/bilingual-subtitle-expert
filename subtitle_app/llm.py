@@ -12,7 +12,6 @@ LLM 服务模块 - 为双语字幕排版提供 AI 能力
 
 import json
 import re
-import traceback
 from typing import Optional
 
 # ── SDK 可用性检测 ────────────────────────────────────────
@@ -105,8 +104,7 @@ The array should ideally have {num_parts} elements. Output JSON only, no other t
                 merged.append(" ".join(parts[num_parts - 1:]))
                 return merged
             else:
-                # 段数不够：复用最后一段（好过空字符串）
-                return parts + [parts[-1]] * (num_parts - len(parts))
+                return parts + [''] * (num_parts - len(parts))
 
         except Exception as e:
             raise RuntimeError(f"LLM 英文断句失败: {e}") from e
@@ -255,16 +253,9 @@ class DeepSeekService(LLMService):
     def __init__(self, api_key: str, model: str = "deepseek-chat"):
         super().__init__(api_key, model)
 
-        # 确保 API Key 是纯 ASCII，避免 HTTP 头编码错误
         self._clean_key = api_key.strip()
-        if not self._clean_key.isascii():
-            original = self._clean_key
-            self._clean_key = self._clean_key.encode("ascii", errors="ignore").decode("ascii")
-            if len(self._clean_key) < len(original) * 0.8:
-                raise ValueError(
-                    f"API Key 包含大量非 ASCII 字符，请检查是否粘贴错误。"
-                    f"原始长度 {len(original)}，清理后 {len(self._clean_key)}"
-                )
+        if not self._clean_key.isascii() or any(c.isspace() for c in self._clean_key):
+            raise ValueError('API Key 含有中文或空白字符，请检查粘贴内容')
 
     def _call_api(self, prompt: str, max_tokens: int) -> str:
         """使用 urllib 直接调用 DeepSeek API，绕过 httpx 编码问题"""
@@ -300,8 +291,7 @@ class DeepSeekService(LLMService):
             err_body = e.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"DeepSeek API HTTP {e.code}: {err_body[:500]}")
         except Exception as e:
-            tb = traceback.format_exc()
-            raise RuntimeError(f"LLM API 调用失败: {e}\n{tb}")
+            raise RuntimeError(f"LLM API 调用失败: {e}") from e
 
 
 # ── 工厂函数 ─────────────────────────────────────────────
@@ -335,10 +325,6 @@ def create_llm_service(
     if model is None:
         model = provider_info["default_model"]
 
-    try:
-        if provider == "deepseek":
-            return DeepSeekService(api_key=api_key, model=model)
-        else:
-            return None
-    except Exception:
-        return None
+    if provider == "deepseek":
+        return DeepSeekService(api_key=api_key, model=model)
+    raise ValueError('不支持的 AI 提供商')

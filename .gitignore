@@ -21,3 +21,7 @@ Thumbs.db
 # Temp files
 *.textClipping
 debug_test*.py
+
+# Local credentials
+.env
+.streamlit/secrets.toml

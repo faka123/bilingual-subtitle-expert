@@ -6,7 +6,7 @@
 POST /api/bilingual-subtitle
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 try:
@@ -98,7 +98,10 @@ def bilingual_subtitle(request: BilingualSubtitleRequest):
     ]
 
     # 调用核心处理逻辑
-    result: BilingualSubtitle = process_bilingual_api(pairs, items)
+    try:
+        result: BilingualSubtitle = process_bilingual_api(pairs, items)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
     # 转换为响应格式
     return BilingualSubtitleResponse(

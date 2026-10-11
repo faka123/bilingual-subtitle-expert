@@ -1,20 +1,13 @@
-#!/bin/bash
-cd "$(dirname "$0")"
-VENV_PYTHON="../venv/bin/python"
-
-echo "🎬 启动双语字幕精确排版专家..."
-echo ""
-
-# 安装缺失依赖（使用清华镜像加速）
-$VENV_PYTHON -c "import streamlit" 2>/dev/null || {
-    echo "⏳ 正在安装依赖..."
-    $VENV_PYTHON -m pip install streamlit python-docx openai anthropic -q -i https://pypi.tuna.tsinghua.edu.cn/simple
-    echo "✅ 完成"
-}
-
-echo "✅ 正在打开浏览器..."
-echo "   Python: $($VENV_PYTHON --version)"
-echo "   按 Ctrl+C 停止"
-echo ""
-
-$VENV_PYTHON -m streamlit run app.py --server.headless true
+#!/usr/bin/env bash
+set -euo pipefail
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
+if [ ! -x "$VENV_PYTHON" ]; then
+    python3 -m venv "$PROJECT_DIR/.venv"
+fi
+if ! "$VENV_PYTHON" -c 'import streamlit, docx, lxml, fastapi, uvicorn, openai' 2>/dev/null; then
+    "$VENV_PYTHON" -m pip install -r "$PROJECT_DIR/requirements.txt"
+fi
+cd "$PROJECT_DIR"
+printf '正在启动双语字幕工具，访问地址见下方输出。按 Ctrl+C 停止。\n'
+exec "$VENV_PYTHON" -m streamlit run "$PROJECT_DIR/streamlit_app.py" --server.headless true "$@"

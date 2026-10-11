@@ -9,6 +9,7 @@ from core import (
     parse_proofread_doc,
     parse_srt,
     parse_docx,
+    decode_text_file,
     text_similarity,
     _chinese_char_ratio,
     _has_chinese,
@@ -132,50 +133,62 @@ def format_text_by_rules(raw_text: str) -> str:
 
 # ── 回调函数（在 widget 实例化之前执行，可以安全操作 session_state）──
 
-def on_proofread_upload():
-    """校对文档上传回调：读取文件内容写入 session_state"""
-    file = st.session_state.get("proofread_file")
+def invalidate_result():
+    for key in ('output_srt', 'stats', 'issues', 'processed'):
+        st.session_state.pop(key, None)
+
+
+def upload_key(name):
+    return f"{name}_{st.session_state.get('input_generation', 0)}"
+
+
+def read_upload(name, target, filename=None):
+    file = st.session_state.get(upload_key(name))
     if file is None:
         return
-    # 记录上传文件名（去除扩展名），用于生成下载文件名
-    st.session_state.proofread_filename = file.name
-    if file.name.endswith(".docx"):
-        st.session_state.proofread_text = parse_docx(file.read())
-    else:
-        st.session_state.proofread_text = file.read().decode("utf-8")
+    invalidate_result()
+    try:
+        data = file.getvalue()
+        text = parse_docx(data) if file.name.lower().endswith('.docx') else decode_text_file(data)
+        st.session_state[target] = text
+        if filename:
+            st.session_state[filename] = file.name
+    except Exception as error:
+        st.error(f"文件读取失败：{error}")
+
+
+def on_proofread_upload():
+    read_upload('proofread_file', 'proofread_text', 'proofread_filename')
 
 
 def on_srt_upload():
-    """SRT 文件上传回调：读取文件内容写入 session_state"""
-    file = st.session_state.get("srt_file")
-    if file is None:
-        return
-    # 记录上传文件名（去除扩展名），用于生成下载文件名
-    st.session_state.srt_filename = file.name
-    st.session_state.srt_text = file.read().decode("utf-8")
+    read_upload('srt_file', 'srt_text', 'srt_filename')
 
 
 def on_load_sample():
-    """加载示例数据回调"""
+    invalidate_result()
     st.session_state.proofread_text = SAMPLE_PROOFREAD
     st.session_state.srt_text = SAMPLE_SRT
 
 
 def on_fill_proofread():
-    """一键填入校对文档回调，并设置标记以弹出提示"""
+    invalidate_result()
     st.session_state.proofread_text = st.session_state.get("formatted_proofread", "")
     st.session_state._auto_filled_from_tab1 = True
 
 
 def on_raw_text_upload():
-    """原始文本上传回调：读取 .txt 或 .docx 文件内容写入 session_state"""
-    file = st.session_state.get("raw_text_file")
-    if file is None:
-        return
-    if file.name.endswith(".docx"):
-        st.session_state.raw_format_text = parse_docx(file.read())
-    else:
-        st.session_state.raw_format_text = file.read().decode("utf-8")
+    st.session_state.pop('formatted_proofread', None)
+    read_upload('raw_text_file', 'raw_format_text')
+
+
+def on_clear():
+    invalidate_result()
+    for key in ('raw_format_text', 'proofread_text', 'srt_text'):
+        st.session_state[key] = ''
+    for key in ('formatted_proofread', 'proofread_filename', 'srt_filename', '_auto_filled_from_tab1'):
+        st.session_state.pop(key, None)
+    st.session_state['input_generation'] = st.session_state.get('input_generation', 0) + 1
 
 
 # ── 页面配置 ──────────────────────────────────────────────
@@ -283,16 +296,24 @@ with st.sidebar:
         max_value=0.9,
         value=0.3,
         step=0.05,
+        on_change=invalidate_result,
         help="中文文本匹配的最低相似度要求。阈值越低越宽松（匹配更多），越高越严格（匹配更准确）。"
     )
 
     renumber = st.checkbox(
         "重新编排序号",
-        value=True,
-        help="开启后会将输出序号重新编排为连续数字（1, 2, 3...），避免原始 SRT 序号间隔导致输出混乱。"
+        value=False,
+        on_change=invalidate_result,
+        help="默认保留原始序号。开启后会将输出序号重新编排为连续数字（1, 2, 3...），避免原始 SRT 序号间隔导致输出混乱。"
     )
 
     st.divider()
+
+    remove_end_punctuation = st.checkbox(
+        "去掉英文句末标点", value=False,
+        on_change=invalidate_result,
+        help="只移除每条英文末尾的句号、逗号、问号和感叹号，保留小数点等内部标点。",
+    )
 
     # ── LLM 设置 ──────────────────────────────────────────
     st.header("🤖 AI 增强")
@@ -338,13 +359,15 @@ with st.sidebar:
     use_llm_split = st.checkbox(
         "AI 英文智能断句",
         value=False,
+        on_change=invalidate_result,
         disabled=not has_llm,
-        help="用 AI 按语义自然拆分英文段落，彻底消除 \"...\" 占位符。启用后英文断句质量大幅提升。",
+        help="用 AI 按语义拆分英文，原文完整性检查失败时回退到规则断句。",
     )
 
     use_llm_match = st.checkbox(
         "AI 语义匹配",
         value=False,
+        on_change=invalidate_result,
         disabled=not has_llm,
         help="用 AI 做中英文语义级匹配，替代字符相似度算法。适合中英文措辞差异较大的场景。",
     )
@@ -410,7 +433,7 @@ with tab_tt1:
     raw_text_file = st.file_uploader(
         "或上传原始文本 (.txt / .docx)",
         type=["txt", "docx"],
-        key="raw_text_file",
+        key=upload_key("raw_text_file"),
         on_change=on_raw_text_upload,
     )
     if raw_text_file:
@@ -517,12 +540,13 @@ with tab_tt2:
             placeholder="中文段落1\n英文段落1\n\n中文段落2\n英文段落2\n\n...",
             label_visibility="collapsed",
             key="proofread_text",
+            on_change=invalidate_result,
         )
 
         proofread_file = st.file_uploader(
             "或上传校对文档 (.docx / .txt)",
             type=["docx", "txt"],
-            key="proofread_file",
+            key=upload_key("proofread_file"),
             on_change=on_proofread_upload,
         )
         if proofread_file:
@@ -536,12 +560,13 @@ with tab_tt2:
             placeholder="1\n00:00:00,200 --> 00:00:02,200\n中文字幕文本\n\n2\n00:00:02,233 --> 00:00:04,666\n中文字幕文本\n\n...",
             label_visibility="collapsed",
             key="srt_text",
+            on_change=invalidate_result,
         )
 
         srt_file = st.file_uploader(
             "或上传 SRT 文件 (.srt)",
             type=["srt", "txt"],
-            key="srt_file",
+            key=upload_key("srt_file"),
             on_change=on_srt_upload,
         )
         if srt_file:
@@ -560,10 +585,7 @@ with tab_tt2:
             disabled=not (proofread_text.strip() and srt_text.strip()),
         )
     with btn_col2:
-        clear_clicked = st.button("🗑️ 清空", use_container_width=True)
-
-    if clear_clicked:
-        st.rerun()
+        st.button("🗑️ 清空", use_container_width=True, on_click=on_clear)
 
     # ── 处理逻辑 ──────────────────────────────────────────────
 
@@ -580,6 +602,8 @@ with tab_tt2:
                     renumber=renumber,
                     llm_service=llm,
                     use_llm_match=use_llm_match if llm else False,
+                    use_llm_split=use_llm_split,
+                    remove_end_punctuation=remove_end_punctuation,
                 )
                 issues = quality_check(output_srt, stats)
 
@@ -608,7 +632,7 @@ with tab_tt2:
             ("SRT 条目", stats.get("srt_entries", 0)),
             ("匹配组数", stats.get("matched_groups", 0)),
             ("已匹配条目", stats.get("matched_entries", 0)),
-            ("低置信度", stats.get("low_confidence_entries", 0)),
+            ("未匹配条目", stats.get("unmatched_entries", 0)),
         ]
 
         # 双语 SRT 检测警告
@@ -617,7 +641,7 @@ with tab_tt2:
 
         for col, (label, value) in zip(stat_cols, stat_items):
             with col:
-                color = "#d62728" if (label == "低置信度" and value > 0) else "#1f77b4"
+                color = "#d62728" if (label == "未匹配条目" and value > 0) else "#1f77b4"
                 st.markdown(f"""
                 <div class="stat-box">
                     <div class="number" style="color:{color}">{value}</div>
@@ -672,12 +696,12 @@ with tab_tt2:
             if llm_split > 0:
                 st.success(f"🤖 AI 断句已生效：{llm_split} 组由 AI 拆分，{rule_split} 组无变化")
             else:
-                st.caption(f"💡 AI 断句未启用：{rule_split} 组由规则算法处理（结果已自动优化，无需担心）")
+                st.caption(f"💡 AI 断句未启用：{rule_split} 组由规则算法处理")
 
-            # LLM 错误静默处理（规则算法已足够好，不影响输出质量）
+            # LLM 错误静默处理（规则算法作为回退）
             llm_errors = stats.get("llm_errors", [])
             if llm_errors:
-                with st.expander("🔍 LLM 调用详情（不影响结果）"):
+                with st.expander("🔍 AI 调用详情（已回退到规则处理）"):
                     for i, err in enumerate(llm_errors[:3]):
                         st.caption(f"#{i+1}: {err[:120]}")
                     if len(llm_errors) > 3:
@@ -702,8 +726,8 @@ with tab_tt2:
         srt_entries = parse_srt(output_srt)
 
         # 分离中英文
-        cn_entries = [e for e in srt_entries if _has_chinese(e.text)]
-        en_entries = [e for e in srt_entries if not _has_chinese(e.text)]
+        cn_entries = srt_entries[:stats.get("srt_entries", 0)]
+        en_entries = srt_entries[stats.get("srt_entries", 0):]
 
         # ── 标签页 ──
         tab1, tab2, tab3 = st.tabs(["📋 完整输出", "🇨🇳 中文部分", "🇺🇸 英文部分"])
@@ -764,8 +788,8 @@ with tab_tt2:
             # 也提供仅英文的下载
             if en_entries:
                 en_only = "\n\n".join(
-                    f"{e.index}\n{e.start_time} --> {e.end_time}\n{e.text}"
-                    for e in en_entries
+                    f"{i}\n{e.start_time} --> {e.end_time}\n{e.text}"
+                    for i, e in enumerate(en_entries, 1)
                 )
                 st.download_button(
                     label="📥 仅下载英文 SRT",

@@ -96,6 +96,36 @@ BilingualParagraph = ProofreadPair  # 旧名
 
 # ── 文档解析 ──────────────────────────────────────────────
 
+def decode_text_file(data: bytes) -> str:
+    """Read common Chinese subtitle encodings without silently dropping bytes."""
+    if data.startswith((b'\xff\xfe', b'\xfe\xff')):
+        return data.decode('utf-16')
+    try:
+        return data.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        try:
+            return data.decode('gb18030')
+        except UnicodeDecodeError as error:
+            raise ValueError('无法识别文件编码，请将文件另存为 UTF-8 后上传') from error
+
+
+def timestamp_ms(value: str) -> int:
+    match = re.fullmatch(r'(\d{2,}):(\d{2}):(\d{2})[,\.](\d{3})', value)
+    if not match:
+        raise ValueError(f'时间格式无效：{value}，应为 HH:MM:SS,mmm')
+    hours, minutes, seconds, millis = map(int, match.groups())
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError(f'时间数值无效：{value}')
+    return ((hours * 60 + minutes) * 60 + seconds) * 1000 + millis
+
+
+def validate_inputs(pairs: list[ProofreadPair], items: list[TimelineItem]):
+    if not pairs or any(not p.chinese.strip() or not p.english.strip() for p in pairs):
+        raise ValueError('校对文档没有完整的中英对照，请按中文一行、英文一行填写')
+    if not items:
+        raise ValueError('没有识别到有效的 SRT 字幕，请检查序号、时间轴和字幕文本')
+
+
 def parse_docx(file_path_or_bytes) -> str:
     """
     从 .docx 文件中提取文本，转换为校对文档格式。
@@ -118,46 +148,36 @@ def parse_docx(file_path_or_bytes) -> str:
     else:
         doc = Document(file_path_or_bytes)
 
-    # 提取所有段落的文本，记录哪些是空段落
-    para_texts = []
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        para_texts.append(text)
-
-    # 也读取表格中的文本（中英对照文档常用表格排版）
-    for table in doc.tables:
-        for row in table.rows:
-            row_texts = []
-            for cell in row.cells:
-                cell_text = cell.text.strip()
-                if cell_text:
-                    row_texts.append(cell_text)
-            # 表格的每一行作为一个"段落"，多列用换行连接
-            if row_texts:
-                para_texts.append("\n".join(row_texts))
-            else:
-                para_texts.append("")  # 空行作为分隔
-
-    # 构建输出：连续的非空段落合并为块，空段落作为块分隔符
-    # 如果连续空段落过多则压缩为一个分隔
+    from docx.oxml.ns import qn
+    def visible_text(element):
+        pieces = []
+        for node in element.iter():
+            if any(parent.tag == qn('w:del') for parent in node.iterancestors()):
+                continue
+            if node.tag == qn('w:t'):
+                pieces.append(node.text or '')
+            elif node.tag in (qn('w:br'), qn('w:cr')):
+                pieces.append('\n')
+            elif node.tag == qn('w:tab'):
+                pieces.append('\t')
+        return ''.join(pieces)
     lines = []
-    prev_empty = False
+    for element in doc.element.body:
+        if element.tag == qn('w:p'):
+            lines.append(visible_text(element))
+        elif element.tag == qn('w:tbl'):
+            for row in element.findall(qn('w:tr')):
+                lines.append('\n'.join(visible_text(cell) for cell in row.findall(qn('w:tc'))))
+                lines.append('')
+    return '\n'.join(lines)
 
-    for text in para_texts:
-        if text:
-            lines.append(text)
-            prev_empty = False
-        else:
-            if not prev_empty and lines:
-                # 前一个非空，插入分隔空行
-                lines.append("")
-            prev_empty = True
 
-    # 去掉末尾多余空行
-    while lines and lines[-1] == "":
-        lines.pop()
-
-    return "\n".join(lines)
+def clean_proofread_text(text: str) -> str:
+    text = text.lstrip('\ufeff').replace('{.mark}', '')
+    text = re.sub(r'\[~~(.*?)~~\]', r'\1', text, flags=re.S)
+    text = re.sub(r'~~(.*?)~~', r'\1', text, flags=re.S)
+    text = text.replace("\\'", "'").replace('\\"', '"')
+    return text
 
 
 def parse_proofread_doc(text: str) -> list[BilingualParagraph]:
@@ -175,52 +195,41 @@ def parse_proofread_doc(text: str) -> list[BilingualParagraph]:
 
     返回 BilingualParagraph 列表。
     """
-    # 按空行分割段落块
-    blocks = re.split(r'\n\s*\n', text.strip())
-
-    paragraphs = []
-    pair_index = 0
-
-    for block in blocks:
-        block = block.strip()
-        if not block:
+    text = clean_proofread_text(text)
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
             continue
-
-        # 提取块内的非空行
-        block_lines = [l.strip() for l in block.split('\n') if l.strip()]
-        if len(block_lines) < 2:
-            continue
-
-        # ── 在块内按中/英交替配对 ──
-        i = 0
-        while i < len(block_lines) - 1:
-            zh_line = block_lines[i]
-            en_line = block_lines[i + 1]
-
-            zh_ratio = _chinese_char_ratio(zh_line)
-            en_ratio = _english_char_ratio(en_line)
-
-            if zh_ratio > 0.3 and en_ratio > 0.3:
-                paragraphs.append(BilingualParagraph(
-                    chinese=zh_line,
-                    english=en_line,
-                    index=pair_index,
-                ))
-                pair_index += 1
-                i += 2
-            else:
-                # 不是标准的中-英对，尝试跳过当前行
-                i += 1
-
-        # 如果块内有落单行（奇数行），记录警告
-        if i == len(block_lines) - 1:
-            leftover = block_lines[i]
-            # 仅在 leftover 看起来像有效文本时警告（非纯数字/符号）
-            if len(leftover) > 3 and (_chinese_char_ratio(leftover) > 0.3 or _english_char_ratio(leftover) > 0.3):
-                import logging
-                logging.warning(f"校对文档解析：块内存在落单行（已丢弃）: {leftover[:80]}...")
-
-    return paragraphs
+        # Split a Chinese/English pair accidentally pasted onto one line.
+        split_at = None
+        for match in re.finditer(r'[a-zA-Z]', line):
+            left, right = line[:match.start()], line[match.start():]
+            if (_has_chinese(left) and not _has_chinese(right)
+                    and _english_char_ratio(right) > 0.3
+                    and right.lower() not in {'sw', 'gld'}):
+                split_at = match.start()
+                break
+        if split_at is not None:
+            lines.extend([line[:split_at].strip(), line[split_at:].strip()])
+        else:
+            lines.append(line)
+    pairs, chinese, english = [], [], []
+    def finish():
+        if chinese and english:
+            pairs.append(BilingualParagraph(chinese=''.join(chinese),
+                                            english=' '.join(english), index=len(pairs)))
+        chinese.clear()
+        english.clear()
+    for line in lines:
+        if _chinese_char_ratio(line) > 0.3:
+            if english:
+                finish()
+            chinese.append(line)
+        elif chinese:
+            english.append(line)
+    finish()
+    return pairs
 
 
 def parse_srt(text: str) -> list[SrtEntry]:
@@ -235,40 +244,40 @@ def parse_srt(text: str) -> list[SrtEntry]:
     返回 SrtEntry 列表。
     """
     # 规范化换行符
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = text.lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
 
     # 按空行分割
-    blocks = re.split(r'\n\s*\n', text.strip())
+    blocks = re.split(r'\n\s*\n', text.strip('\n'))
 
     entries = []
-    for block in blocks:
-        block = block.strip()
-        if not block:
+    for block_number, block in enumerate(blocks, 1):
+        block = block.strip('\n')
+        if not block.strip():
             continue
 
         lines = block.split('\n')
-        if len(lines) < 3:
-            continue
+        if len(lines) < 2:
+            raise ValueError(f'SRT 第 {block_number} 块缺少序号、时间轴或字幕文本')
 
         # 第一行：序号
         try:
             index = int(lines[0].strip())
         except ValueError:
-            continue
+            raise ValueError(f'SRT 第 {block_number} 块的序号不是整数')
 
         # 第二行：时间轴
         time_match = re.match(
-            r'(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})',
+            r'(\d{2,}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2,}:\d{2}:\d{2}[,\.]\d{3})(?:\s.*)?$',
             lines[1].strip()
         )
         if not time_match:
-            continue
+            raise ValueError(f'SRT 第 {block_number} 块的时间轴格式无效')
 
         start_time = time_match.group(1)
         end_time = time_match.group(2)
 
         # 剩余行：字幕文本
-        text_content = '\n'.join(lines[2:]).strip()
+        text_content = '\n'.join(lines[2:])
 
         entries.append(SrtEntry(
             index=index,
@@ -341,6 +350,14 @@ def _has_chinese(text: str) -> bool:
     return bool(re.search(r'[一-鿿]', text))
 
 
+def is_old_english(text: str) -> bool:
+    # Keep blank, numerical, symbolic and masked Chinese cues in the framework.
+    if _has_chinese(text) or not text.strip():
+        return False
+    words = re.findall(r'[a-zA-Z]+', text)
+    return bool(words) and any(word.lower() not in {'sw', 'gld', 'mg', 'kg', 'cm', 'm', 'g'} for word in words)
+
+
 def _english_char_ratio(text: str) -> float:
     """计算英文字符占比"""
     if not text:
@@ -362,9 +379,8 @@ def match_segments_to_paragraphs(
     """
     将 SRT 字幕条目匹配到对应的双语段落。
 
-    核心原则：**绝不丢弃任何条目**。每个 SRT 条目都会匹配到最佳段落，
-    即使相似度低于阈值也会强制匹配。阈值仅影响统计报告中的"低置信度"计数，
-    不影响实际匹配行为。
+    核心原则：**绝不丢弃任何条目**。有效 SRT 文本匹配到最佳段落，
+    相似度低于阈值或文本为空时留作未匹配，输出时保留条目并留空英文。
     """
     if not paragraphs:
         return []
@@ -372,7 +388,7 @@ def match_segments_to_paragraphs(
     if not srt_entries:
         return []
 
-    # ── 第一步：为每个 SRT 条目找到最匹配的段落（始终匹配，不用阈值过滤）──
+    # ── 第一步：为有效 SRT 条目找到最匹配的段落 ──
     entry_para_map: dict[int, int] = {}       # entry_index -> paragraph_index
     entry_score_map: dict[int, float] = {}   # entry_index -> best_score
 
@@ -386,9 +402,10 @@ def match_segments_to_paragraphs(
                 best_score = score
                 best_idx = pi
 
-        # 始终匹配到最佳段落（即使得分为 0）
-        entry_para_map[entry.index] = best_idx
-        entry_score_map[entry.index] = best_score
+        if best_score < threshold or not entry.text.strip():
+            continue
+        entry_para_map[id(entry)] = best_idx
+        entry_score_map[id(entry)] = best_score
 
     # ── 第二步：按段落分组，保持 SRT 原始顺序 ──
     # 使用 dict 保持插入顺序（Python 3.7+）
@@ -396,7 +413,9 @@ def match_segments_to_paragraphs(
     para_group_order: list[int] = []
 
     for entry in srt_entries:
-        pi = entry_para_map[entry.index]
+        if id(entry) not in entry_para_map:
+            continue
+        pi = entry_para_map[id(entry)]
         if pi not in para_groups:
             para_groups[pi] = []
             para_group_order.append(pi)
@@ -408,12 +427,12 @@ def match_segments_to_paragraphs(
         group = para_groups[pi]
         # 计算组内平均相似度
         avg_sim = sum(
-            entry_score_map.get(e.index, 0.0) for e in group
+            entry_score_map.get(id(e), 0.0) for e in group
         ) / len(group)
 
         results.append(MatchResult(
             paragraph=paragraphs[pi],
-            segments=sorted(group, key=lambda e: e.index),
+            segments=group,
             similarity=avg_sim
         ))
 
@@ -617,9 +636,11 @@ def split_english_text(en_text: str, num_parts: int, chinese_segments: Optional[
         overflow = " ".join(parts[num_parts - 1:])
         parts = parts[:num_parts - 1] + [overflow]
     elif len(parts) < num_parts:
-        # 段数不够时，复用最后一段内容（好过空字符串或 [MISSING]）
-        parts.extend([parts[-1]] * (num_parts - len(parts)))
+        # 段数不够时留空，避免重复原文
+        parts.extend([''] * (num_parts - len(parts)))
 
+    if ' '.join(parts).split() != en_text.split():
+        parts = _split_by_chars(en_text, num_parts)
     return parts
 
 
@@ -648,7 +669,7 @@ def _split_proportional(en_text: str, cn_segments: list[str]) -> list[str]:
     if total_words <= num_parts:
         result = words[:]
         while len(result) < num_parts:
-            result.append(words[-1])
+            result.append('')
         return result[:num_parts]
 
     MIN_WORDS = min(3, max(1, total_words // num_parts))
@@ -705,7 +726,7 @@ def _split_proportional(en_text: str, cn_segments: list[str]) -> list[str]:
     # 后处理
     result = [p for p in result if p.strip()]
     while len(result) < num_parts:
-        result.append(result[-1] if result else "[EMPTY]")
+        result.append('')
     if len(result) > num_parts:
         overflow = ' '.join(result[num_parts - 1:])
         result = result[:num_parts - 1] + [overflow]
@@ -818,7 +839,7 @@ def _clause_pool_assign(words, clauses, breakpoints, targets, num_parts, MIN_WOR
                     last = last[best_bp:]
                     parts[-1] = (parts[-1] + ' ' + ' '.join(moved_words)).strip()
 
-    parts.append(' '.join(last) if last else (parts[-1] if parts else ''))
+    parts.append(' '.join(last) if last else '')
     return parts
 
 
@@ -1189,14 +1210,13 @@ def _split_by_chars(text: str, num_parts: int) -> list[str]:
     total_words = len(words)
 
     if total_words == 0:
-        return ["[EMPTY]"] + ["[...]"] * (num_parts - 1)
+        return [''] * num_parts
 
-    # 当分段数超过单词数时，每个单词最多一段，剩余段落复用最后一个单词
-    # （避免产生 "..." 占位符，确保每条字幕都有实际内容）
+    # 分段数超过单词数时，每个单词最多一段，剩余段落留空
     if num_parts > total_words:
         parts = words[:]  # 每个单词一段
-        # 剩余段落填入最后一个单词（比 "..." 占位符更好）
-        parts.extend([words[-1]] * (num_parts - total_words))
+        # 剩余段落留空，由质量检查提示
+        parts.extend([''] * (num_parts - total_words))
         return parts
 
     # 按单词数尽量均匀分配到各部分
@@ -1240,17 +1260,15 @@ def split_english_text_llm(
     try:
         parts = llm_service.split_english_text(en_text, num_parts)
         # 验证结果有效性：每个部分都有实际文本
-        if all(p and p.strip() and p.strip() != "..." for p in parts):
-            # 作为内容完整性验证，检查每段的单词是否都在原文中
-            en_words_lower = set(en_text.lower().split())
-            for p in parts:
-                p_words = set(p.lower().split())
-                if not p_words.issubset(en_words_lower):
-                    # LLM 可能捏造了内容，回退到规则算法
-                    raise ValueError("LLM 输出包含原文不存在的单词，回退到规则算法")
+        if (len(parts) == num_parts
+                and all(isinstance(p, str) and p.strip() and p.strip() != "..." for p in parts)):
+            if ' '.join(parts).split() != en_text.split():
+                raise ValueError("AI 断句改变或遗漏了原文，已回退到规则断句")
             return parts
-    except Exception:
-        pass  # 静默回退，规则断句已足够好
+        raise ValueError('AI 断句数量或内容无效，已回退到规则断句')
+    except Exception as error:
+        if errors is not None:
+            errors.append(str(error))
 
     # 回退到规则方法（使用中文段长度参考提升断句质量）
     return split_english_text(en_text, num_parts, chinese_segments=chinese_segments)
@@ -1261,7 +1279,7 @@ def split_english_text_llm(
 def generate_bilingual_srt(
     results: list[MatchResult],
     original_srt: list[SrtEntry],
-    renumber: bool = True,
+    renumber: bool = False,
     llm_service=None,
 ) -> tuple[str, dict]:
     """
@@ -1319,7 +1337,8 @@ def generate_bilingual_srt(
 
     english_index = max_cn_index + 1
 
-    for mr in sorted(results, key=lambda r: r.segments[0].index if r.segments else float('inf')):
+    english_by_entry = {}
+    for mr in results:
         # 安全网：如果 en_segments 多于 segments，合并多余的段到最后一段
         seg_count = len(mr.segments)
         en_count = len(mr.en_segments)
@@ -1331,14 +1350,16 @@ def generate_bilingual_srt(
             if i < len(mr.en_segments):
                 en_text = mr.en_segments[i]
             else:
-                en_text = "[MISSING]"
+                en_text = ""
 
-            output_lines.append(str(english_index))
-            output_lines.append(f"{seg.start_time} --> {seg.end_time}")
-            output_lines.append(en_text)
-            output_lines.append("")
+            english_by_entry[id(seg)] = en_text
 
-            english_index += 1
+    for seg in original_srt:
+        output_lines.append(str(english_index))
+        output_lines.append(f"{seg.start_time} --> {seg.end_time}")
+        output_lines.append(english_by_entry.get(id(seg), ''))
+        output_lines.append("")
+        english_index += 1
 
     llm_stats = {
         "llm_enabled": llm_service is not None,
@@ -1355,9 +1376,11 @@ def process_subtitles(
     proofread_text: str,
     srt_text: str,
     similarity_threshold: float = 0.3,
-    renumber: bool = True,
+    renumber: bool = False,
     llm_service=None,
     use_llm_match: bool = False,
+    use_llm_split: bool = True,
+    remove_end_punctuation: bool = False,
 ) -> tuple[str, dict]:
     """
     完整的字幕处理流程。
@@ -1366,9 +1389,11 @@ def process_subtitles(
     - proofread_text: 校对文档文本
     - srt_text: SRT 时间轴文档文本
     - similarity_threshold: 相似度匹配阈值（0.0～1.0，默认 0.3）
-    - renumber: 是否重新编排序号为连续数字（推荐 True）
+    - renumber: 是否重新编排序号（默认 False，保留原始序号）
     - llm_service: LLM 服务实例（可选），启用 AI 增强功能
     - use_llm_match: 是否用 LLM 做语义匹配（需要 llm_service）
+    - use_llm_split: 是否启用 AI 断句，与匹配选项独立
+    - remove_end_punctuation: 是否去掉英文条目末尾标点
 
     返回：
     - output_srt: 生成的双语 SRT 文本
@@ -1379,13 +1404,18 @@ def process_subtitles(
     all_srt_entries = parse_srt(srt_text)
 
     # 2. 过滤：只保留中文 SRT 条目用于匹配（用 _has_chinese 避免短文本误判）
-    cn_srt_entries = [e for e in all_srt_entries if _has_chinese(e.text)]
-    en_srt_entries = [e for e in all_srt_entries if not _has_chinese(e.text)]
+    cn_srt_entries = [e for e in all_srt_entries if not is_old_english(e.text)]
+    en_srt_entries = [e for e in all_srt_entries if is_old_english(e.text)]
 
-    # 用中文条目做匹配，用全部条目做原始参考
-    srt_entries = cn_srt_entries if cn_srt_entries else all_srt_entries
+    # 只保留中文框架，忽略旧英文
+    srt_entries = cn_srt_entries
+    validate_inputs(paragraphs, srt_entries)
+
+    if not any(_has_chinese(e.text) for e in srt_entries):
+        raise ValueError('时间轴文档没有可识别的中文字幕')
 
     # 3. 匹配（可选 LLM 语义匹配）
+    match_errors = []
     if use_llm_match and llm_service and paragraphs:
         try:
             srt_texts = [e.text for e in srt_entries]
@@ -1394,7 +1424,8 @@ def process_subtitles(
             results = _build_match_results_from_llm(
                 srt_entries, paragraphs, llm_matches, similarity_threshold
             )
-        except Exception:
+        except Exception as error:
+            match_errors.append(f'AI 匹配失败，已回退到规则匹配：{error}')
             # LLM 匹配失败，回退到规则匹配
             results = match_segments_to_paragraphs(
                 srt_entries, paragraphs, similarity_threshold
@@ -1406,8 +1437,16 @@ def process_subtitles(
 
     # 3. 生成输出（只传入中文 SRT 条目作为原始参考，避免重复已存在的英文）
     output, llm_stats = generate_bilingual_srt(
-        results, srt_entries, renumber=renumber, llm_service=llm_service
+        results, srt_entries, renumber=renumber,
+        llm_service=llm_service if use_llm_split else None
     )
+    llm_stats['llm_errors'] = match_errors + llm_stats['llm_errors']
+
+    if remove_end_punctuation:
+        output_entries = parse_srt(output)
+        for entry in output_entries[len(srt_entries):]:
+            entry.text = re.sub(r'[.,!?，。！？]+$', '', entry.text.rstrip())
+        output = '\n\n'.join(f'{e.index}\n{e.start} --> {e.end}\n{e.text}' for e in output_entries) + '\n'
 
     # 4. 统计
     matched_count = sum(len(r.segments) for r in results)
@@ -1425,6 +1464,8 @@ def process_subtitles(
 
     stats = {
         "paragraphs": len(paragraphs),
+        "unused_paragraphs": len(paragraphs) - len({id(r.paragraph) for r in results}),
+        "renumber": renumber,
         "srt_entries": len(srt_entries),
         "srt_total_entries": len(all_srt_entries),
         "srt_en_entries_filtered": len(en_srt_entries),
@@ -1433,8 +1474,9 @@ def process_subtitles(
         "matched_entries": matched_count,
         "low_confidence_groups": low_confidence_count,
         "low_confidence_entries": low_confidence_entries,
-        "unmatched_entries": 0,  # 始终为 0，因为强制匹配所有条目
+        "unmatched_entries": len(srt_entries) - matched_count,
         **llm_stats,
+        "llm_enabled": llm_service is not None,
     }
 
     return output, stats
@@ -1452,55 +1494,33 @@ def _build_match_results_from_llm(
     LLM 返回 [{srt_index, paragraph_index, confidence}, ...]，
     此函数将其整理为按段落分组的 MatchResult。
     """
-    # 按段落索引分组
-    para_groups: dict[int, list[SrtEntry]] = {}
-    entry_confidence: dict[int, float] = {}
-
+    assignments = {}
     for match in llm_matches:
-        srt_idx = match.get("srt_index", 0)
-        para_idx = match.get("paragraph_index", 0)
-        confidence = match.get("confidence", 0.5)
+        si, pi = match.get("srt_index"), match.get("paragraph_index")
+        if (type(si) is not int or type(pi) is not int
+                or not 0 <= si < len(srt_entries) or not 0 <= pi < len(paragraphs)
+                or si in assignments):
+            raise ValueError("AI 匹配返回重复或越界索引")
+        confidence = float(match.get("confidence", 0.5))
+        if not 0 <= confidence <= 1:
+            raise ValueError("AI 匹配置信度无效")
+        assignments[si] = (pi, confidence)
 
-        if para_idx not in para_groups:
-            para_groups[para_idx] = []
-        if srt_idx < len(srt_entries):
-            para_groups[para_idx].append(srt_entries[srt_idx])
-            entry_confidence[srt_idx] = confidence
-
-    # 确保每个 SRT 条目都有归属（LLM 可能遗漏）
-    matched_indices = set()
-    for group in para_groups.values():
-        for e in group:
-            matched_indices.add(e.index)
-
-    for entry in srt_entries:
-        if entry.index not in matched_indices:
-            # 未匹配条目归到第一个段落（兜底）
-            if 0 not in para_groups:
-                para_groups[0] = []
-            para_groups[0].append(entry)
-
-    # 构建结果
-    results = []
-    for pi in sorted(para_groups.keys()):
-        group = para_groups[pi]
-        if pi < len(paragraphs):
-            para = paragraphs[pi]
+    groups = {}
+    scores = {}
+    for position, entry in enumerate(srt_entries):
+        if position in assignments:
+            pi, confidence = assignments[position]
         else:
-            # LLM 可能返回越界索引，用第一个段落兜底
-            para = paragraphs[0] if paragraphs else BilingualParagraph(chinese="", english="")
-
-        avg_confidence = sum(
-            entry_confidence.get(e.index, 0.5) for e in group
-        ) / len(group) if group else 0.0
-
-        results.append(MatchResult(
-            paragraph=para,
-            segments=sorted(group, key=lambda e: e.index),
-            similarity=avg_confidence,
-        ))
-
-    return results
+            pi = max(range(len(paragraphs)), key=lambda i: text_similarity(entry.text, paragraphs[i].zh))
+            confidence = text_similarity(entry.text, paragraphs[pi].zh)
+        if not entry.text.strip() or confidence < threshold:
+            continue
+        groups.setdefault(pi, []).append(entry)
+        scores.setdefault(pi, []).append(confidence)
+    return [MatchResult(paragraph=paragraphs[pi], segments=group,
+                        similarity=sum(scores[pi]) / len(group))
+            for pi, group in groups.items()]
 
 
 # ── 质量检查 ──────────────────────────────────────────────
@@ -1508,6 +1528,10 @@ def _build_match_results_from_llm(
 def quality_check(output_srt: str, stats: dict) -> list[str]:
     """对输出结果进行质量检查，返回问题列表。"""
     issues = []
+    if stats.get('unmatched_entries', 0):
+        issues.append(f"有 {stats['unmatched_entries']} 条字幕未匹配，对应英文留空，请核对校对文档")
+    if stats.get('unused_paragraphs', 0):
+        issues.append(f"有 {stats['unused_paragraphs']} 个校对段落未使用，可能缺少对应时间轴")
 
     entries = parse_srt(output_srt)
 
@@ -1540,7 +1564,7 @@ def quality_check(output_srt: str, stats: dict) -> list[str]:
             issues.append(f"中文序号不连续，检测到 {len(cn_indices)} 条字幕但有间隔")
 
         en_indices = [e.index for e in en_entries]
-        expected_en_start = len(cn_indices) + 1
+        expected_en_start = max(cn_indices) + 1
         expected_en = list(range(expected_en_start, expected_en_start + len(en_indices)))
         if en_indices != expected_en:
             issues.append(f"英文序号不连续，期望从 {expected_en_start} 开始")
@@ -1557,7 +1581,17 @@ def quality_check(output_srt: str, stats: dict) -> list[str]:
         if not e.text.strip():
             issues.append(f"序号 {e.index} 字幕为空")
 
-    # 注：低置信度匹配和行长度超标已由工具自动处理，不再弹出警告
+    for cn, en in zip(cn_entries, en_entries):
+        if (cn.start, cn.end) != (en.start, en.end):
+            issues.append(f'序号 {cn.index} 的中英文时间轴不一致')
+        try:
+            if timestamp_ms(cn.start) >= timestamp_ms(cn.end):
+                issues.append(f'序号 {cn.index} 的时间轴异常，已按原文保留')
+        except ValueError:
+            issues.append(f'序号 {cn.index} 的时间轴数值异常，已按原文保留')
+        if len(en.text) > 42:
+            issues.append(f'英文序号 {en.index} 超过 42 字符，已优先保留完整内容')
+
 
     return issues
 
@@ -1580,6 +1614,7 @@ def process_bilingual_api(
     返回：
     - BilingualSubtitle: chinese_part + english_part
     """
+    validate_inputs(proofread_pairs, timeline_items)
     # 匹配
     results = match_segments_to_paragraphs(
         timeline_items, proofread_pairs, similarity_threshold
@@ -1600,19 +1635,17 @@ def process_bilingual_api(
     ]
 
     # 构建英文部分（从中文数量+1开始编号）
-    en_start_index = len(timeline_items) + 1
+    en_start_index = max(t.index for t in timeline_items) + 1
     english_part = []
     en_idx = en_start_index
 
-    for mr in sorted(results, key=lambda r: r.segments[0].index if r.segments else float('inf')):
-        for i, seg in enumerate(mr.segments):
-            en_text = mr.en_segments[i] if i < len(mr.en_segments) else "[MISSING]"
-            english_part.append(TimelineItem(
-                index=en_idx,
-                start=seg.start,
-                end=seg.end,
-                text=en_text,
-            ))
-            en_idx += 1
+    english_by_entry = {id(seg): mr.en_segments[i]
+                        for mr in results for i, seg in enumerate(mr.segments)}
+    for seg in timeline_items:
+        english_part.append(TimelineItem(
+            index=en_idx, start=seg.start, end=seg.end,
+            text=english_by_entry.get(id(seg), ''),
+        ))
+        en_idx += 1
 
     return BilingualSubtitle(chinese_part=chinese_part, english_part=english_part)
