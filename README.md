@@ -56,7 +56,7 @@ curl -X POST http://localhost:8502/api/bilingual-subtitle \
 
 ## Render
 
-已有配置 `render.yaml`：构建 `pip install -r requirements.txt`，启动 `streamlit run streamlit_app.py --server.port=$PORT --server.address=0.0.0.0`。
+已有配置 `render.yaml`：构建 `pip install -r requirements.txt`，启动 `python -m streamlit run streamlit_app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true`，健康检查路径为 `/_stcore/health`。
 如需登录密码，使用 Render 环境变量 `APP_PASSWORD`。不要提交密码、API Key 或本机虚拟环境。
 
 ## 验证
